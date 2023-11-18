@@ -6,7 +6,8 @@ use std::{
 use std::io::ErrorKind::InvalidInput;
 use syncserver::{TcpServer, TcpClient, Runnable};
 
-fn main() -> Result<(), Error>{
+/// Start either the server or the client.
+fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let mode = args.get(1)
         .ok_or_else(|| Error::new(InvalidInput, "mode (0) must be included"))?;
@@ -16,8 +17,8 @@ fn main() -> Result<(), Error>{
         .map_err(|e| Error::new(InvalidInput, e))?;
 
     let result = match mode.as_str() {
-        "server" => TcpServer::new(socket).run(),
-        "client" => TcpClient::new(socket).run(),
+        "server" => TcpServer { socket }.start(),
+        "client" => TcpClient { socket }.start(),
         _ => panic!("{}", Error::new(InvalidInput, "mode (0) must be either server or client"))
     };
 

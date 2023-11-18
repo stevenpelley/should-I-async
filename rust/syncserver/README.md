@@ -1,5 +1,6 @@
 # TCP Server
-Multithreaded server/client. The client will just send dummy data. The server will echo back.
+Multithreaded server/client. The client will just send dummy data. The server will echo back. Launch the server before
+the client (if not, you'll immediately encounter a refused connection error).
 
 # Usage
 ## Start server:
