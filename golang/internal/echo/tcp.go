@@ -3,7 +3,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/go-errors/errors"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -38,7 +38,7 @@ func Accept(
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return err
+			return errors.Wrap(err, 0)
 		}
 		go func() {
 			err := handleConnection(ctx, conn)
@@ -62,16 +62,19 @@ func handleConnection(ctx context.Context, conn net.Conn) error {
 
 	bytesWritten, err := conn.Write(DialResponseBytes)
 	if err != nil {
-		return fmt.Errorf("write DialResponse: %w", err)
+		return errors.Wrap(err, 0)
 	}
 	if bytesWritten != len(DialResponseBytes) {
-		return fmt.Errorf(
+		return errors.Errorf(
 			"handleConnection: wrote incomplete DialResponse. bytes: %v",
 			bytesWritten)
 	}
 
 	_, err = io.Copy(conn, conn)
-	return err
+	if err != nil {
+		return errors.Wrap(err, 0)
+	}
+	return nil
 }
 
 // An Accept error handler to log the error.
@@ -85,14 +88,14 @@ func WriteBytes(message []byte, writer *bufio.Writer) (
 	numberBytes int, err error) {
 	n, err := writer.Write(message)
 	if err != nil {
-		return n, fmt.Errorf("WriteBytes Write: %w", err)
+		return n, errors.Wrap(err, 0)
 	}
 	if n != len(message) {
-		return n, fmt.Errorf("WriteBytes Write failed to write entire message: %v", n)
+		return n, errors.Errorf("WriteBytes Write failed to write entire message: %v", n)
 	}
 	err = writer.Flush()
 	if err != nil {
-		return n, fmt.Errorf("WriteBytes Flush: %w", err)
+		return n, errors.Wrap(err, 0)
 	}
 	return n, nil
 }
@@ -107,7 +110,7 @@ func ReadBytes(reader *bufio.Reader) (
 		if err == io.EOF && len(readBytes) == 0 {
 			return true, readBytes, nil
 		} else {
-			return true, readBytes, fmt.Errorf(
+			return true, readBytes, errors.Errorf(
 				"ReadBytes. readBytes: '%v': %w",
 				readBytes,
 				err)
@@ -125,7 +128,7 @@ func Dial(
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
+		return nil, errors.Wrap(err, 0)
 	}
 	return conn, nil
 }
@@ -144,14 +147,14 @@ func DialAndTest(
 	// the server establishes connections faster than it can Accept() them.
 	err := sem.Acquire(ctx, 1)
 	if err != nil {
-		return nil, fmt.Errorf("acquire semaphore: %w", err)
+		return nil, errors.Wrap(err, 0)
 	}
 	defer sem.Release(1)
 
 	for {
 		conn, err := Dial(ctx, network, address)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, 0)
 		}
 
 		connOk, err := testNewConn(ctx, conn)
@@ -163,7 +166,7 @@ func DialAndTest(
 			continue
 		} else {
 			conn.Close()
-			return nil, fmt.Errorf("testNewConn after dial: %w", err)
+			return nil, errors.Wrap(err, 0)
 		}
 	}
 }
@@ -185,11 +188,11 @@ func testNewConn(ctx context.Context, conn net.Conn) (connOk bool, err error) {
 		// retry Dial and read
 		return false, nil
 	} else if err != nil {
-		return false, fmt.Errorf("client dial ReadString: %w", err)
+		return false, errors.Wrap(err, 0)
 	}
 
 	if readString != DialResponse {
-		return false, fmt.Errorf("client dial ReadString unexpected response: %v", readString)
+		return false, errors.Errorf("client dial ReadString unexpected response: %v", readString)
 	}
 
 	return true, nil
@@ -209,7 +212,7 @@ func RunClient(
 	connResetCount *atomic.Int64) error {
 	conn, err := DialAndTest(ctx, sem, "tcp", ":8080", connResetCount)
 	if err != nil {
-		return fmt.Errorf("client dialAndTest: %w", err)
+		return errors.Wrap(err, 0)
 	}
 	defer conn.Close()
 
@@ -226,13 +229,13 @@ func RunClient(
 	for i := 0; i < iterations; i++ {
 		_, err = WriteBytes(messageBytes, readWriter.Writer)
 		if err != nil {
-			return fmt.Errorf("client: %w", err)
+			return errors.Wrap(err, 0)
 		}
 		done, _, err := ReadBytes(readWriter.Reader)
 		if err != nil {
-			return fmt.Errorf("client: %w", err)
+			return errors.Wrap(err, 0)
 		} else if done {
-			return fmt.Errorf("client unexpected EOF")
+			return errors.Errorf("client unexpected EOF")
 		}
 	}
 

@@ -3,7 +3,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-errors/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
