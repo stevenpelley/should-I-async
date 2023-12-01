@@ -36,3 +36,9 @@ Figure 1 in the above paper shows a time series of IPC during and after a syscal
 6. Measure and Profile each of the client and server.  Profile the overall system to ensure that the container and virtual network do not impose overheads independent of the type of client that will impact our conclusions.  Compare the request throughput between async and thread-blocking.
 7. Build additional clients for comparison.  Examples might be thread-blocking and async in the same language (C/C++, Rust, Java with virtual threads).
 8. Repeat measurements and profiling.  Search for measurements that measure the IPC effect of syscalls and context switches as directly as possible
+
+## Additional References
+* intel rdpmc from userspace https://community.intel.com/t5/Software-Tuning-Performance/Configuring-the-PMU-to-read-Perfomance-Counters/m-p/1177708
+* PAPI https://github.com/icl-utk-edu/papi tool intended to instrument your source code with "calipers" to read performance counters within a section.
+* perf toggle event https://lwn.net/Articles/568602/ perf event to trigger enabling/disabling perf counters in kernel.  This is what I want, assuming latency to toggle is small (100s ns).  Unfortunately it appears this was never merged and no one continued working on it.
+* PINTool https://www.intel.com/content/www/us/en/developer/articles/tool/pin-a-dynamic-binary-instrumentation-tool.html consider dynamically instrumenting code randomly in the hope of discovering ~5-10us segments following return from syscalls without introducing too many other injection points.
