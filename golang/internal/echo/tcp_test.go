@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,6 +21,29 @@ import (
 
 var connResetCount atomic.Int64
 
+func createClientEchoArgs(ctxKill context.Context, iterations int64) EchoArgs {
+	return EchoArgs{
+		CtxKill:       ctxKill,
+		CtxTerm:       context.Background(),
+		StopCondition: NewStopConditionOnIterations(iterations),
+	}
+}
+
+func createServerEchoArgs(ctxKill context.Context) EchoArgs {
+	return EchoArgs{
+		CtxKill: ctxKill,
+		CtxTerm: context.Background(),
+	}
+}
+
+func createDialer(dialLimit int64) *Dialer {
+	return &Dialer{
+		Sem:     semaphore.NewWeighted(dialLimit),
+		Network: "tcp",
+		Address: ":8080",
+	}
+}
+
 func TestServe(t *testing.T) {
 	require := require.New(t)
 	dur, err := time.ParseDuration(("10s"))
@@ -31,8 +55,10 @@ func TestServe(t *testing.T) {
 	group, ctxGroup := errgroup.WithContext(ctxTest)
 
 	numClients := 500
-	iterationsPerClient := 100
-	sem := semaphore.NewWeighted(100)
+	iterationsPerClient := int64(100)
+	dialer := createDialer(100)
+	clientEchoArgs := createClientEchoArgs(ctxGroup, iterationsPerClient)
+	serverEchoArgs := createServerEchoArgs(ctxTest)
 
 	wg1 := new(sync.WaitGroup)
 	wg1.Add(numClients)
@@ -41,7 +67,7 @@ func TestServe(t *testing.T) {
 	wg2.Add(1)
 
 	// start the echo server
-	listener, err := CreateTCPListener(8080)
+	listener, err := net.Listen("tcp", ":8080")
 	require.NoError(err)
 	defer listener.Close()
 	removeAfterFunc := context.AfterFunc(ctxTest, func() {
@@ -52,7 +78,7 @@ func TestServe(t *testing.T) {
 
 	group.Go(func() error {
 		defer wg2.Done()
-		return Accept(ctxTest, listener, LoggingErrorHandler)
+		return Accept(serverEchoArgs, listener, LoggingErrorHandler)
 	})
 
 	for i := 0; i < numClients; i++ {
@@ -60,11 +86,9 @@ func TestServe(t *testing.T) {
 		group.Go(func() error {
 			defer wg1.Done()
 			return RunClient(
-				ctxGroup,
-				iterationsPerClient,
-				sem,
-				fmt.Sprintf("client%v\n", i),
-				&connResetCount)
+				clientEchoArgs,
+				dialer,
+				fmt.Sprintf("client%v\n", i))
 		})
 	}
 
@@ -125,7 +149,7 @@ func TestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
 	defer cancelTimeoutCtx()
 	group, ctx := errgroup.WithContext(ctx)
 
-	listener, err := CreateTCPListener(8080)
+	listener, err := net.Listen("tcp", ":8080")
 	require.NoError(err)
 	defer listener.Close()
 
@@ -135,18 +159,14 @@ func TestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
 	wg1.Add(numClients)
 
 	// never block dialing
-	sem := semaphore.NewWeighted(int64(numClients))
+	dialer := createDialer(int64(numClients))
+	echoArgs := createClientEchoArgs(ctx, 0)
 
 	for i := 0; i < numClients; i++ {
 		i := i
 		group.Go(func() error {
 			defer wg1.Done()
-			return RunClient(
-				ctx,
-				100,
-				sem,
-				fmt.Sprintf("client%v\n", i),
-				&connResetCount)
+			return RunClient(echoArgs, dialer, fmt.Sprintf("client%v\n", i))
 		})
 	}
 
@@ -196,7 +216,7 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 	defer cancelTimeoutCtx()
 	group, ctx := errgroup.WithContext(ctxTimeout)
 
-	listener, err := CreateTCPListener(8080)
+	listener, err := net.Listen("tcp", ":8080")
 	require.NoError(err)
 	defer listener.Close()
 	defer context.AfterFunc(ctx, func() {
@@ -233,7 +253,7 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 		}
 
 		reader := bufio.NewReader(conn)
-		_, _, err = ReadBytes(reader)
+		_, _, err = readBytes(reader)
 		if err == nil {
 			err = errors.New("server: expected error but found nil")
 		}
@@ -245,7 +265,7 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 	// Client dials (no test)
 	// this _DOES_ use waitgroup.Go and so when it exits closes the associated ctx
 	group.Go(func() error {
-		conn, err := Dial(ctx, "tcp", ":8080")
+		conn, err := createDialer(1).dial(ctx)
 		if err != nil {
 			return err
 		}
@@ -309,7 +329,7 @@ func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 	defer cancelTimeoutCtx()
 	group, ctx := errgroup.WithContext(ctx)
 
-	listener, err := CreateTCPListener(8080)
+	listener, err := net.Listen("tcp", ":8080")
 	require.NoError(err)
 	defer listener.Close()
 	defer context.AfterFunc(ctx, func() {
@@ -352,7 +372,7 @@ func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 
 		// Read, pass err to assert ECONNRESET
 		reader := bufio.NewReader(conn)
-		_, _, err = ReadBytes(reader)
+		_, _, err = readBytes(reader)
 		chanErr <- err
 
 		return nil
@@ -360,7 +380,7 @@ func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 
 	// Client dials (no test)
 	group.Go(func() error {
-		conn, err := Dial(ctx, "tcp", ":8080")
+		conn, err := createDialer(1).dial(ctx)
 		if err != nil {
 			return err
 		}
