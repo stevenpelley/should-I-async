@@ -10,7 +10,6 @@ import (
 	"time"
 
 	echo "github.com/stevenpelley/should-I-async/golang/internal/echo"
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -24,7 +23,7 @@ var (
 
 // client flags
 var (
-	numClients int64
+	numClients int
 )
 
 // server flags
@@ -61,33 +60,28 @@ func main() {
 	}
 	cmd, args := args[0], args[1:]
 
+	// set up contexts
 	ctx, ctxCancelFunc := context.WithCancel(context.Background())
 	defer ctxCancelFunc()
+
+	gracefulStopCh := make(chan struct{})
+	stopConditions := echo.StopConditions{StopCh: gracefulStopCh}
+
+	// connect SIGINT and SIGTERM to gracefulStopCh.
+	// and 2s after gracefulStopCh is set we will finish ctx
 
 	flagSet := flag.NewFlagSet(cmd, flag.ExitOnError)
 	switch cmd {
 	case "client":
-		flagSet.Int64Var(&numClients, "numClients", 0, "number of echo clients.  Required, must be positive")
+		flagSet.IntVar(&numClients, "numClients", 0, "number of echo clients.  Required, must be positive")
 		_ = flagSet.Parse(args)
 		if numClients <= 0 {
 			fmt.Fprintln(os.Stderr, "numClients required and must be positive")
 			os.Exit(2)
 		}
-		group, ctxGroup := errgroup.WithContext(ctx)
-		ctxKill, _ := context.WithCancel(ctxGroup)
 		sem := semaphore.NewWeighted(100)
 		dialer := &echo.Dialer{Sem: sem, Network: network, Address: address}
-		echoArgs := echo.EchoArgs{CtxKill: ctxKill, CtxTerm: context.TODO()}
-		for i := int64(0); i < numClients; i++ {
-			i := i
-			group.Go(func() error {
-				return echo.RunClient(
-					echoArgs,
-					dialer,
-					fmt.Sprintf("client%v\n", i))
-			})
-		}
-		err = group.Wait()
+		err = echo.RunClients(ctx, numClients, stopConditions, dialer)
 		if err != nil {
 			panic(err)
 		}
@@ -104,8 +98,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		echoArgs := echo.EchoArgs{CtxKill: context.TODO(), CtxTerm: context.TODO()}
-		echo.Accept(echoArgs, listener, echo.PanicErrorHandler)
+		echo.Accept(ctx, stopConditions, listener)
 	default:
 		log.Fatalf("Unrecognized command %q.  Command must be one of: client, server", cmd)
 	}

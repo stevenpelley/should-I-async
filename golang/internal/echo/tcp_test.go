@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -19,21 +17,14 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-var connResetCount atomic.Int64
-
-func createClientEchoArgs(ctxKill context.Context, iterations int64) EchoArgs {
-	return EchoArgs{
-		CtxKill:       ctxKill,
-		CtxTerm:       context.Background(),
-		StopCondition: NewStopConditionOnIterations(iterations),
+func createClientStopConditions(iterations int64) StopConditions {
+	return StopConditions{
+		NumIterations: iterations,
 	}
 }
 
-func createServerEchoArgs(ctxKill context.Context) EchoArgs {
-	return EchoArgs{
-		CtxKill: ctxKill,
-		CtxTerm: context.Background(),
-	}
+func createServerStopConditions() StopConditions {
+	return StopConditions{}
 }
 
 func createDialer(dialLimit int64) *Dialer {
@@ -46,64 +37,70 @@ func createDialer(dialLimit int64) *Dialer {
 
 func TestServe(t *testing.T) {
 	require := require.New(t)
-	dur, err := time.ParseDuration(("10s"))
-	require.NoError(err)
-	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), dur)
-	defer cancelTimeout()
-	ctxTest, ctxCancelFunc := context.WithCancel(ctxTimeout)
-	defer ctxCancelFunc()
-	group, ctxGroup := errgroup.WithContext(ctxTest)
 
 	numClients := 500
 	iterationsPerClient := int64(100)
 	dialer := createDialer(100)
-	clientEchoArgs := createClientEchoArgs(ctxGroup, iterationsPerClient)
-	serverEchoArgs := createServerEchoArgs(ctxTest)
 
-	wg1 := new(sync.WaitGroup)
-	wg1.Add(numClients)
-
-	wg2 := new(sync.WaitGroup)
-	wg2.Add(1)
+	// create some contexts
+	// timeout
+	dur, err := time.ParseDuration(("10s"))
+	require.NoError(err)
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), dur)
+	defer cancelTimeout()
 
 	// start the echo server
 	listener, err := net.Listen("tcp", ":8080")
 	require.NoError(err)
 	defer listener.Close()
-	removeAfterFunc := context.AfterFunc(ctxTest, func() {
+	removeAfterFunc := context.AfterFunc(ctx, func() {
 		// stops the listener and unblocks calls to Accept
 		listener.Close()
 	})
 	defer removeAfterFunc()
 
-	group.Go(func() error {
-		defer wg2.Done()
-		return Accept(serverEchoArgs, listener, LoggingErrorHandler)
+	serverGroup := errgroup.Group{}
+	serverGroup.Go(func() error {
+		return Accept(ctx, createServerStopConditions(), listener)
 	})
 
-	for i := 0; i < numClients; i++ {
-		i := i
-		group.Go(func() error {
-			defer wg1.Done()
-			return RunClient(
-				clientEchoArgs,
-				dialer,
-				fmt.Sprintf("client%v\n", i))
-		})
+	clientErr := RunClients(
+		ctx,
+		numClients,
+		createClientStopConditions(iterationsPerClient),
+		dialer)
+	if clientErr != nil {
+		clientErr = errors.Errorf("client: %w", clientErr)
 	}
 
-	wg1.Wait()
-	err = ctxGroup.Err()
-	if ctxGroup.Err() != nil {
-		ctxCancelFunc()
-	}
+	slog.Info("RunClients", "ECONNRESET retry count", dialer.ConnResetCount.Load())
+
 	listener.Close()
-	require.NoError(err)
-	// if no error then give the server handlers a chance to see their connections
-	// close
-	wg2.Wait()
+	serverErr := serverGroup.Wait()
+	// Match assignability instead of errors.Is() because we _do_ want to see
+	// any server conn handling errors.  Don't just match the first AcceptErr
+	// and ignore the rest.
+	_, ok := serverErr.(*AcceptErr)
+	var isContextDone bool
+	select {
+	case <-ctx.Done():
+		isContextDone = true
+	default:
+	}
+	if ok && !isContextDone {
+		// Accept returned as expected and returned an error to indicate
+		// that Listener.Accept() was interrupted
+		serverErr = nil
+	}
+	if serverErr != nil {
+		serverErr = errors.Errorf("server: %w", serverErr)
+	}
 
-	slog.Info("connReset Count", "count", connResetCount.Load())
+	joinedErr := errors.Join(clientErr, serverErr)
+	if joinedErr != nil {
+		require.NoError(joinedErr)
+	}
+	require.NoError(joinedErr)
 }
 
 // ECONNRESET occurs on MacOS because the queue of incoming TCP connection
@@ -160,13 +157,22 @@ func TestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
 
 	// never block dialing
 	dialer := createDialer(int64(numClients))
-	echoArgs := createClientEchoArgs(ctx, 0)
 
 	for i := 0; i < numClients; i++ {
-		i := i
 		group.Go(func() error {
 			defer wg1.Done()
-			return RunClient(echoArgs, dialer, fmt.Sprintf("client%v\n", i))
+			conn, err := dialer.dial(ctx)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			defer context.AfterFunc(ctx, func() {
+				conn.Close()
+			})()
+
+			reader := bufio.NewReader(conn)
+			_, _, err = readBytes(reader)
+			return err
 		})
 	}
 
@@ -239,17 +245,11 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 			conn.Close()
 		})
 
-		// block on client returning
+		// block on client closing
 		select {
 		case <-ctxTimeout.Done():
-			return fmt.Errorf("server select on client closing: %w", ctxTimeout.Err())
+			return fmt.Errorf("server timeout on client closing: %w", ctxTimeout.Err())
 		case <-ch1:
-		}
-
-		// Read, pass err to assert "use of closed network connection"
-		_, err = io.Copy(conn, conn)
-		if err == nil {
-			return fmt.Errorf("server io.Copy: %w", err)
 		}
 
 		reader := bufio.NewReader(conn)
@@ -262,7 +262,7 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 		return nil
 	}()
 
-	// Client dials (no test)
+	// Client dials, writes anything, and closes
 	// this _DOES_ use waitgroup.Go and so when it exits closes the associated ctx
 	group.Go(func() error {
 		conn, err := createDialer(1).dial(ctx)
@@ -274,11 +274,12 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 		// but its connection will close.  I believe what's happening is that even
 		// if we close its connection and the read buffer is empty it gracefully
 		// returns EOF
-		bytesWritten, err := conn.Write(DialResponseBytes)
+		bytes := []byte("asdf")
+		bytesWritten, err := conn.Write(bytes)
 		if err != nil {
 			return err
 		}
-		if bytesWritten != len(DialResponseBytes) {
+		if bytesWritten != len(bytes) {
 			return err
 		}
 		return nil
@@ -320,6 +321,9 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 // I assume the conclusion is that whoever closes the connection should do so after
 // a read, not a write.  The conclusion may also be to always assume RST and handle
 // gracefully.
+//
+// NOTE: I'm sometimes seeing a race here where the server's ReadBytes() gets done=true
+// and no error.
 func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 	require := require.New(t)
 
@@ -350,18 +354,17 @@ func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 			conn.Close()
 		})
 
-		bytesWritten, err := conn.Write(DialResponseBytes)
+		bytes := []byte("asdf")
+		bytesWritten, err := conn.Write(bytes)
 		if err != nil {
 			return err
 		}
-		if bytesWritten != len(DialResponseBytes) {
+		if bytesWritten != len(bytes) {
 			return err
 		}
 
 		// signal to client that we are done writing
 		close(ch1)
-
-		// client closes
 
 		// block on client closing
 		select {
@@ -372,7 +375,10 @@ func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 
 		// Read, pass err to assert ECONNRESET
 		reader := bufio.NewReader(conn)
-		_, _, err = readBytes(reader)
+		done, readBytes, err := readBytes(reader)
+		if err == nil {
+			slog.Error("expected server err on readBytes", "done", done, "readBytes", readBytes, "err", err)
+		}
 		chanErr <- err
 
 		return nil
@@ -407,4 +413,13 @@ func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 	case <-ctx.Done():
 		t.Errorf("context done prior to chanErr: %v", ctx.Err())
 	}
+}
+
+func TestIsErrorRetriable(t *testing.T) {
+	require := require.New(t)
+	err1 := errors.Wrap(syscall.ECONNRESET, 0)
+	err2 := &firstIterationErr{cause: err1}
+	require.ErrorIs(err2, syscall.ECONNRESET)
+	var fiErr *firstIterationErr
+	require.ErrorAs(err2, &fiErr)
 }

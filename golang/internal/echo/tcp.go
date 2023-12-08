@@ -3,39 +3,33 @@ package server
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/go-errors/errors"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
-var DialResponse string = "connected\n"
-var DialResponseBytes []byte = []byte(DialResponse)
-
-var DoneResponse string = "done\n"
-var DoneResponseBytes []byte = []byte(DoneResponse)
-
-// conditions on which we'll stop.  Note that there are always ctxKill and
-// ctxTerm which we'll respond do.  The zero value provides no conditions
-type StopCondition struct {
+// Conditions on which we'll stop gracefully.  There will always be contexts
+// passed for which execution will stop immediately and return with an error
+// (even if just to say it was interrupted).  Stopping with any of the
+// conditions here should not return an error.
+type StopConditions struct {
 	// if 0 we will not stop based on number of iterations
-	numIterations int64
+	NumIterations int64
+	// stop gracefully when the channel closes
+	StopCh chan struct{}
 }
 
-func (sc StopCondition) panicIfInvalid() {
-	if sc.numIterations < 0 {
+func (sc StopConditions) panicIfInvalid() {
+	if sc.NumIterations < 0 {
 		panic("StopCondition may not have negative numIterations")
-
 	}
-}
-
-func NewStopConditionOnIterations(numIterations int64) StopCondition {
-	return StopCondition{numIterations: numIterations}
 }
 
 type Dialer struct {
@@ -45,19 +39,17 @@ type Dialer struct {
 	Address        string
 }
 
-func (d *Dialer) GetConnResetCount() int64 {
-	return d.ConnResetCount.Load()
+// error representing an error while dialing.  These may be transient and retriable
+type dialErr struct {
+	cause error
 }
 
-// dial on the provided network and address.  Returns a valid connection and
-// nil, or nil and an error.
-func (d *Dialer) dial(ctx context.Context) (net.Conn, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, d.Network, d.Address)
-	if err != nil {
-		return nil, errors.Wrap(err, 0)
-	}
-	return conn, nil
+func (f *dialErr) Error() string {
+	return fmt.Sprintf("dial err: %v", f.cause)
+}
+
+func (f *dialErr) Unwrap() error {
+	return f.cause
 }
 
 // Dial and test the new connection by reading until newline.  It expects to
@@ -71,109 +63,136 @@ func (d *Dialer) dialAndTest(ctx context.Context) (net.Conn, error) {
 		return nil, errors.Wrap(err, 0)
 	}
 	defer d.Sem.Release(1)
-
-	for {
-		conn, err := d.dial(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, 0)
-		}
-
-		connOk, err := testNewConn(ctx, conn)
-		if connOk {
-			return conn, nil
-		} else if err == nil {
-			conn.Close()
-			d.ConnResetCount.Add(1)
-			continue
-		} else {
-			conn.Close()
-			return nil, errors.Wrap(err, 0)
-		}
+	conn, err := d.dial(ctx)
+	if err != nil {
+		return nil, &dialErr{cause: errors.Wrap(err, 0)}
 	}
+	return conn, nil
 }
 
-// test the new conn.  If connOk use the conn.  If !connOk and err == nil retry.
-// Otherwise if err != nil abort.  Treats syscall.ECONNRESET as a retryable error.
-// Does not close the connection
-func testNewConn(ctx context.Context, conn net.Conn) (connOk bool, err error) {
-	// close the connection, unblocking any Read(), if the context ends
-	// defer "unregister" this AfterFunc
-	defer context.AfterFunc(ctx, func() {
-		conn.Close()
-	})()
-
-	reader := bufio.NewReader(conn)
-	readString, err := reader.ReadString('\n')
-	// we don't expect EOF.  Treat it as an error
-	if errors.Is(err, syscall.ECONNRESET) {
-		// retry Dial and read
-		return false, nil
-	} else if err != nil {
-		return false, errors.Wrap(err, 0)
-	}
-
-	if readString != DialResponse {
-		return false, errors.Errorf("client dial ReadString unexpected response: %v", readString)
-	}
-
-	return true, nil
+func (d *Dialer) dial(ctx context.Context) (net.Conn, error) {
+	return net.Dial(d.Network, d.Address)
 }
 
-// state that controls the execution and termination of the echo client and server
-// EchoArgs may be passed by value and copied
-type EchoArgs struct {
-	// as in SIGKILL.  Close connections and return immediately when finished
-	CtxKill context.Context
-	// as SIGTERM.  Attempt to gracefully finish quickly when finished.
-	CtxTerm context.Context
-	// describes additional conditions as to when it should stop
-	StopCondition StopCondition
+type AcceptErr struct {
+	childErr error
 }
 
-type ErrorHandler func(err error)
-
-var LoggingErrorHandler ErrorHandler = func(err error) {
-	slog.Error("handleConnection", "error", err)
+func (a *AcceptErr) Error() string {
+	return fmt.Sprintf("accept: %v", a.childErr)
 }
 
-var PanicErrorHandler ErrorHandler = func(err error) {
-	log.Panic(err)
-}
-
-// Accept on the listener until the listener is closed.
-// The provided context is passed to the handler for each each accepted connection.
-// Connections that end in an error are passed to the provided errorHandler.
+// Accept on the listener until the listener is closed or the context is
+// cancelled, in which case we close the listener.  A closed listener will still
+// return an error, which we wrap in AcceptErr to allow matching with errors.As.
+// It it up to the caller to determine how this error should be treated.
+// Additionally, Accept blocks until all accepted connections are handled.  Such
+// connections should stop gracefully based on the conditions of stopConditions,
+// and should stop immediately and return an error when ctx finishes.
+// should the call to Listener.Accept and connection handling both return errors
+// they will be joined and returned.
 func Accept(
-	echoArgs EchoArgs,
-	listener net.Listener,
-	errorHandler ErrorHandler) error {
+	ctx context.Context,
+	stopConditions StopConditions,
+	listener net.Listener) (err error) {
 	// forces Accept to return when the context closes
-	defer context.AfterFunc(echoArgs.CtxKill, func() {
+	defer context.AfterFunc(ctx, func() {
 		listener.Close()
 	})()
-	defer context.AfterFunc(echoArgs.CtxTerm, func() {
-		listener.Close()
-	})()
+
+	group, ctxGroup := errgroup.WithContext(ctx)
+	defer func() {
+		// join any errgroup error with other returned error
+		// overwrites err as a named return value to do so
+		err2 := group.Wait()
+		if err2 == nil {
+			// keep on returning err, which might be nil
+			return
+		}
+		if err == nil {
+			err = err2
+			return
+		}
+		// otherwise both are non-nil
+		err = errors.Join(err, err2)
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return errors.Wrap(err, 0)
+			return &AcceptErr{childErr: err}
 		}
-		go func() {
-			err := handleConnection(echoArgs, conn)
+		group.Go(func() error {
+			err := handleConnection(ctxGroup, stopConditions, conn)
 			if err != nil {
-				errorHandler(err)
+				return errors.Errorf("first server handle err: %w", err)
 			}
-		}()
+			return nil
+		})
 	}
 }
 
+// Run a set of clients.  Returns when all client goroutines return which will
+// happen when the provided context finishes or when one of the stopConditions
+// is reached.
+func RunClients(
+	ctx context.Context,
+	numClients int,
+	stopConditions StopConditions,
+	dialer *Dialer) error {
+
+	group, ctxGroup := errgroup.WithContext(ctx)
+
+	for i := 0; i < numClients; i++ {
+		i := i
+		group.Go(func() error {
+			return runClientWithRetry(
+				ctxGroup,
+				stopConditions,
+				dialer,
+				fmt.Sprintf("client%v\n", i))
+		})
+	}
+	return group.Wait()
+}
+
 // Run a single client.
-func RunClient(
-	echoArgs EchoArgs,
+func runClientWithRetry(
+	ctx context.Context,
+	stopConditions StopConditions,
 	dialer *Dialer,
-	message string) error {
-	conn, err := dialer.dialAndTest(echoArgs.CtxKill)
+	message string) (err error) {
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		i := i
+		err = runClient(ctx, stopConditions, dialer, message)
+		if isErrorRetriable(err) {
+			slog.Info("retrying runRoundTripLoop", "iteration", i, "err", err)
+			continue
+		}
+		return err
+	}
+	return errors.Errorf("exhausted %v retries: %w", maxRetries, err)
+}
+
+func isErrorRetriable(err error) bool {
+	var fiErr *firstIterationErr
+	isFirstIterationErr := errors.As(err, &fiErr)
+	var dErr *dialErr
+	isDialErr := errors.As(err, &dErr)
+	return err != nil && ((errors.Is(err, syscall.ECONNRESET) && isFirstIterationErr) ||
+		(errors.Is(err, syscall.EPIPE) && isFirstIterationErr) ||
+		isDialErr)
+}
+
+// Run a single client without retry.  The connection used in this method will
+// be closed and must not escape this scope.
+func runClient(
+	ctx context.Context,
+	stopConditions StopConditions,
+	dialer *Dialer,
+	message string) (err error) {
+	conn, err := dialer.dialAndTest(ctx)
 	if err != nil {
 		return errors.Wrap(err, 0)
 	}
@@ -181,35 +200,25 @@ func RunClient(
 
 	// close the connection when the context ends to unblock any blocking calls
 	// (i.e., Read or Write)
-	defer context.AfterFunc(echoArgs.CtxKill, func() {
+	defer context.AfterFunc(ctx, func() {
 		conn.Close()
 	})()
 
-	return runRoundTripLoop(echoArgs, conn, []byte(message))
+	return runRoundTripLoop(stopConditions, conn, []byte(message))
 }
 
 // Handle a single TCP listener connection.  Echoes everything read from the
 // connection back to the peer.  This will return io.EOF if the client closes
 // connection.
-func handleConnection(echoArgs EchoArgs, conn net.Conn) error {
+func handleConnection(ctx context.Context, stopConditions StopConditions, conn net.Conn) error {
 	defer func() {
 		conn.Close()
 	}()
 	// if the context is closed we close the connection to unblock any
 	// blocking calls to Read and Write
-	defer context.AfterFunc(echoArgs.CtxKill, func() {
+	defer context.AfterFunc(ctx, func() {
 		conn.Close()
 	})()
-
-	bytesWritten, err := conn.Write(DialResponseBytes)
-	if err != nil {
-		return errors.Wrap(err, 0)
-	}
-	if bytesWritten != len(DialResponseBytes) {
-		return errors.Errorf(
-			"handleConnection: wrote incomplete DialResponse. bytes: %v",
-			bytesWritten)
-	}
 
 	reader := bufio.NewReader(bufio.NewReader(conn))
 	done, bytesRead, err := readBytes(reader)
@@ -219,7 +228,97 @@ func handleConnection(echoArgs EchoArgs, conn net.Conn) error {
 		return errors.Errorf("server unexpected EOF")
 	}
 
-	return runRoundTripLoop(echoArgs, conn, bytesRead)
+	return runRoundTripLoop(stopConditions, conn, bytesRead)
+}
+
+// firstIterationErr is a wrapping error used when the first iteration of
+// runRoundTripLoop encounters an error using its connection.  Such an error may
+// indicate a transient error condition that can be retried by first creating a
+// new connection.  It appears that some tcp handshake errors, races, or rare
+// states result in both sides connecting successfully but then the first use
+// resulting in a RST response, at which point we get an ECONNRESET error.
+// This happens under load with a high rate of packet loss due to OS network
+// buffers being full, so I suspect the problem is that the handshake completes
+// but then some downstream buffer is full and so when the first packet arrives
+// it cannot associate it with an open connection and responds with RST.
+type firstIterationErr struct {
+	cause error
+}
+
+func (f *firstIterationErr) Error() string {
+	return fmt.Sprintf("runRoundTripLoop first iteration: %v", f.cause)
+}
+
+func (f *firstIterationErr) Unwrap() error {
+	return f.cause
+}
+
+// Run the round trip loop, writing and then listening on the provided
+// connection.  The first write uses firstBytes, subsequent writes will echo the
+// previous read.  The loop continues until the condition within stopCondition
+// is met.  To return immediately when a context finishes have the completion of
+// the context close the provided connection.  The ctxTerm acts as a stop
+// condition to gracefully end the loop without closing the connection prior to
+// sending EOF.
+//
+// runRoundTripLoop does not accept a context.  Any hard timeout or stop
+// condition that should result in an error must already be set up to close conn
+// or set its timeout.
+// graceful stopping conditions are provided in stopConditions.
+func runRoundTripLoop(
+	stopConditions StopConditions,
+	conn net.Conn,
+	firstBytes []byte) error {
+	stopConditions.panicIfInvalid()
+	readWriter := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+
+	runIteration := func(bytes []byte) (done bool, read []byte, err error) {
+		_, err = writeBytes(bytes, readWriter.Writer)
+		if err != nil {
+			return true, nil, errors.Wrap(err, 0)
+		}
+		done, read, err = readBytes(readWriter.Reader)
+		if err != nil {
+			return done, read, errors.Wrap(err, 0)
+		}
+		return done, read, nil
+	}
+
+	done := false
+	bytes := firstBytes
+	var err error
+
+	stopOnIterations := stopConditions.NumIterations != 0
+	for i := 0; true; i++ {
+		// check for graceful stop conditions
+		if done {
+			return nil
+		}
+		if stopOnIterations && i >= int(stopConditions.NumIterations) {
+			return nil
+		}
+		select {
+		case <-stopConditions.StopCh:
+			return nil
+		default:
+		}
+
+		// done will be checked at start of next iteration
+		done, bytes, err = runIteration(bytes)
+		if err != nil && i == 0 {
+			// error on first iteration is likely related to handshake and retry
+			// may succeed
+			return &firstIterationErr{cause: errors.Wrap(err, 0)}
+		}
+		if err != nil {
+			return errors.Wrap(err, 0)
+		}
+		if stopOnIterations && done {
+			return errors.Errorf("unexpected EOF.  Should stop on iterations")
+		}
+	}
+	// shouldn't reach but compiler can't figure it out
+	return nil
 }
 
 // Write the provided message to the provided writer.
@@ -246,71 +345,14 @@ func writeBytes(message []byte, writer *bufio.Writer) (
 func readBytes(reader *bufio.Reader) (
 	done bool, readBytes []byte, err error) {
 	readBytes, err = reader.ReadBytes('\n')
+	if err == io.EOF && len(readBytes) == 0 {
+		return true, readBytes, nil
+	}
 	if err != nil {
-		if err == io.EOF && len(readBytes) == 0 {
-			return true, readBytes, nil
-		} else {
-			return true, readBytes, errors.Errorf(
-				"ReadBytes. readBytes: '%v': %w",
-				readBytes,
-				err)
-		}
+		return true, readBytes, errors.Errorf(
+			"ReadBytes. readBytes: '%v': %w",
+			readBytes,
+			err)
 	}
 	return false, readBytes, nil
-}
-
-// Run the round trip loop, writing and then listening on the provided
-// connection.  The first write uses firstBytes, subsequent writes will echo the
-// previous read.  The loop continues until the condition within stopCondition
-// is met.  To return immediately when a context finishes have the completion of
-// the context close the provided connection.  The ctxTerm acts as a stop
-// condition to gracefully end the loop without closing the connection prior to
-// sending EOF.
-func runRoundTripLoop(
-	echoArgs EchoArgs,
-	conn net.Conn,
-	firstBytes []byte) error {
-	echoArgs.StopCondition.panicIfInvalid()
-	readWriter := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-
-	runIteration := func(bytes []byte) (done bool, read []byte, err error) {
-		_, err = writeBytes(bytes, readWriter.Writer)
-		if err != nil {
-			return true, nil, errors.Wrap(err, 0)
-		}
-		done, read, err = readBytes(readWriter.Reader)
-		if err != nil {
-			return done, read, errors.Wrap(err, 0)
-		}
-		return done, read, nil
-	}
-
-	done := false
-	bytes := firstBytes
-	var err error
-
-	stopOnIterations := echoArgs.StopCondition.numIterations != 0
-	for i := 0; true; i++ {
-		if stopOnIterations && i >= int(echoArgs.StopCondition.numIterations) {
-			return nil
-		}
-		select {
-		case <-echoArgs.CtxTerm.Done():
-			return nil
-		default:
-		}
-
-		done, bytes, err = runIteration(bytes)
-		if err != nil {
-			return err
-		}
-		if stopOnIterations && done {
-			return errors.Errorf("unexpected EOF.  Should stop on iterations")
-		}
-		if done {
-			return nil
-		}
-	}
-	// shouldn't reach but compiler can't figure it out
-	return nil
 }
