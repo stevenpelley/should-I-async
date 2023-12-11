@@ -145,5 +145,9 @@ func main() {
 	// turn off the watchdog timer
 	close(finishedCh)
 
-	fmt.Println(cm.CombinedJson())
+	combined, err := cm.Combined()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(combined)
 }

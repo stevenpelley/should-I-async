@@ -105,7 +105,9 @@ func TestServe(t *testing.T) {
 	require.NoError(joinedErr)
 
 	// times 2 because we count for both client and server
-	require.Equal(2*int64(numClients)*iterationsPerClient, connMetricsSet.combined().Count)
+	metrics, err := connMetricsSet.Combined()
+	require.NoError(err)
+	require.Equal(2*int64(numClients)*iterationsPerClient, metrics.Count)
 }
 
 // ECONNRESET occurs on MacOS because the queue of incoming TCP connection

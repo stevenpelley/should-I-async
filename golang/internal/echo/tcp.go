@@ -8,11 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/go-errors/errors"
+	"github.com/montanaflynn/stats"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
@@ -78,7 +80,24 @@ func (d *Dialer) dial(ctx context.Context) (net.Conn, error) {
 
 // unexported
 type connMetrics struct {
-	Count int64 `json:"count"`
+	count int64
+}
+
+// exported, used as aggregate metrics
+type ConnMetrics struct {
+	Count        int64   `json:"count"`
+	MinCount     int64   `json:"minCount"`
+	MaxCount     int64   `json:"maxCount"`
+	AverageCount float64 `json:"averageCount"`
+	StdDevCount  float64 `json:"StdDevCount"`
+}
+
+func (c *ConnMetrics) String() string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }
 
 // exported
@@ -87,7 +106,7 @@ type ConnMetricsSet struct {
 	connMetrics []*connMetrics
 }
 
-func (c *ConnMetricsSet) NewConn() *connMetrics {
+func (c *ConnMetricsSet) newConn() *connMetrics {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cm := &connMetrics{}
@@ -95,23 +114,54 @@ func (c *ConnMetricsSet) NewConn() *connMetrics {
 	return cm
 }
 
-func (c *ConnMetricsSet) combined() connMetrics {
-	cm := connMetrics{}
-	for _, thisCm := range c.connMetrics {
-		cm.Count += thisCm.Count
-	}
-	return cm
-}
-
-func (c *ConnMetricsSet) CombinedJson() string {
+func (c *ConnMetricsSet) Combined() (*ConnMetrics, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	cm := c.combined()
-	b, err := json.Marshal(cm)
-	if err != nil {
-		panic(err)
+	numConns := len(c.connMetrics)
+	// make a []float64 for stats library
+	fs := make([]float64, numConns)
+	var total int64
+	for i, thisCm := range c.connMetrics {
+		fs[i] = float64(thisCm.count)
+		total += thisCm.count
 	}
-	return string(b)
+
+	var err error
+	apply := func(destination any, applyFunc func(stats.Float64Data) (float64, error)) {
+		// short circuit on first err
+		if err != nil {
+			return
+		}
+		f, err := applyFunc(fs)
+		if err != nil {
+			return
+		}
+
+		v := reflect.ValueOf(destination)
+		if v.Kind() != reflect.Pointer {
+			panic(fmt.Sprintf("destination must be either *int64 or *float64.  destination Kind(): %v", v.Kind()))
+		}
+		elem := v.Elem()
+		switch elem.Kind() {
+		case reflect.Float64:
+			elem.SetFloat(f)
+		case reflect.Int64:
+			elem.SetInt(int64(f))
+		default:
+			panic(fmt.Sprintf("destination must be either *int64 or *float64.  Elem Kind(): %v", elem.Kind()))
+		}
+	}
+
+	cm := ConnMetrics{}
+	apply(&cm.Count, stats.Sum)
+	apply(&cm.MaxCount, stats.Max)
+	apply(&cm.MinCount, stats.Min)
+	apply(&cm.AverageCount, stats.Mean)
+	apply(&cm.StdDevCount, stats.StandardDeviation)
+	if err != nil {
+		return nil, err
+	}
+	return &cm, nil
 }
 
 type AcceptErr struct {
@@ -371,9 +421,9 @@ func runRoundTripLoop(
 		}
 
 		if cm == nil {
-			cm = connMetricsSet.NewConn()
+			cm = connMetricsSet.newConn()
 		}
-		cm.Count++
+		cm.count++
 	}
 }
 
