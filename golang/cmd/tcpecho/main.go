@@ -7,6 +7,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"runtime/debug"
+	"syscall"
 	"time"
 
 	echo "github.com/stevenpelley/should-I-async/golang/internal/echo"
@@ -60,15 +63,39 @@ func main() {
 	}
 	cmd, args := args[0], args[1:]
 
-	// set up contexts
+	// set up contexts and stop conditions.
 	ctx, ctxCancelFunc := context.WithCancel(context.Background())
 	defer ctxCancelFunc()
-
 	gracefulStopCh := make(chan struct{})
 	stopConditions := echo.StopConditions{StopCh: gracefulStopCh}
 
 	// connect SIGINT and SIGTERM to gracefulStopCh.
 	// and 2s after gracefulStopCh is set we will finish ctx
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	finishedCh := make(chan struct{})
+
+	go func() {
+		select {
+		case <-finishedCh:
+			return
+		case <-signalCh:
+		}
+		close(gracefulStopCh)
+		timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelTimeout()
+		select {
+		case <-finishedCh:
+			return
+		case <-timeoutCtx.Done():
+		}
+
+		fmt.Fprint(os.Stderr, "hang after signal detected.  Producing stacks to debug")
+		debug.SetTraceback("all")
+		panic("hang after signal detected")
+	}()
+
+	var cm echo.ConnMetricsSet
 
 	flagSet := flag.NewFlagSet(cmd, flag.ExitOnError)
 	switch cmd {
@@ -81,7 +108,7 @@ func main() {
 		}
 		sem := semaphore.NewWeighted(100)
 		dialer := &echo.Dialer{Sem: sem, Network: network, Address: address}
-		err = echo.RunClients(ctx, numClients, stopConditions, dialer)
+		err = echo.RunClients(ctx, numClients, stopConditions, dialer, &cm)
 		if err != nil {
 			panic(err)
 		}
@@ -98,8 +125,25 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		echo.Accept(ctx, stopConditions, listener)
+		defer listener.Close()
+
+		// close the listener on graceful stop
+		go func() {
+			select {
+			case <-finishedCh:
+				return
+			case <-gracefulStopCh:
+				listener.Close()
+			}
+		}()
+
+		echo.Accept(ctx, stopConditions, &cm, listener)
 	default:
 		log.Fatalf("Unrecognized command %q.  Command must be one of: client, server", cmd)
 	}
+
+	// turn off the watchdog timer
+	close(finishedCh)
+
+	fmt.Println(cm.CombinedJson())
 }

@@ -3,10 +3,12 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -74,6 +76,44 @@ func (d *Dialer) dial(ctx context.Context) (net.Conn, error) {
 	return net.Dial(d.Network, d.Address)
 }
 
+// unexported
+type connMetrics struct {
+	Count int64 `json:"count"`
+}
+
+// exported
+type ConnMetricsSet struct {
+	mu          sync.Mutex
+	connMetrics []*connMetrics
+}
+
+func (c *ConnMetricsSet) NewConn() *connMetrics {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cm := &connMetrics{}
+	c.connMetrics = append(c.connMetrics, cm)
+	return cm
+}
+
+func (c *ConnMetricsSet) combined() connMetrics {
+	cm := connMetrics{}
+	for _, thisCm := range c.connMetrics {
+		cm.Count += thisCm.Count
+	}
+	return cm
+}
+
+func (c *ConnMetricsSet) CombinedJson() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cm := c.combined()
+	b, err := json.Marshal(cm)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
 type AcceptErr struct {
 	childErr error
 }
@@ -94,6 +134,7 @@ func (a *AcceptErr) Error() string {
 func Accept(
 	ctx context.Context,
 	stopConditions StopConditions,
+	connMetricsSet *ConnMetricsSet,
 	listener net.Listener) (err error) {
 	// forces Accept to return when the context closes
 	defer context.AfterFunc(ctx, func() {
@@ -123,7 +164,7 @@ func Accept(
 			return &AcceptErr{childErr: err}
 		}
 		group.Go(func() error {
-			err := handleConnection(ctxGroup, stopConditions, conn)
+			err := handleConnection(ctxGroup, stopConditions, connMetricsSet, conn)
 			if err != nil {
 				return errors.Errorf("first server handle err: %w", err)
 			}
@@ -139,7 +180,9 @@ func RunClients(
 	ctx context.Context,
 	numClients int,
 	stopConditions StopConditions,
-	dialer *Dialer) error {
+	dialer *Dialer,
+	connMetricsSet *ConnMetricsSet,
+) error {
 
 	group, ctxGroup := errgroup.WithContext(ctx)
 
@@ -150,6 +193,7 @@ func RunClients(
 				ctxGroup,
 				stopConditions,
 				dialer,
+				connMetricsSet,
 				fmt.Sprintf("client%v\n", i))
 		})
 	}
@@ -161,11 +205,12 @@ func runClientWithRetry(
 	ctx context.Context,
 	stopConditions StopConditions,
 	dialer *Dialer,
+	connMetricsSet *ConnMetricsSet,
 	message string) (err error) {
 	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
 		i := i
-		err = runClient(ctx, stopConditions, dialer, message)
+		err = runClient(ctx, stopConditions, dialer, connMetricsSet, message)
 		if isErrorRetriable(err) {
 			slog.Info("retrying runRoundTripLoop", "iteration", i, "err", err)
 			continue
@@ -191,6 +236,7 @@ func runClient(
 	ctx context.Context,
 	stopConditions StopConditions,
 	dialer *Dialer,
+	connMetricsSet *ConnMetricsSet,
 	message string) (err error) {
 	conn, err := dialer.dialAndTest(ctx)
 	if err != nil {
@@ -204,13 +250,17 @@ func runClient(
 		conn.Close()
 	})()
 
-	return runRoundTripLoop(stopConditions, conn, []byte(message))
+	return runRoundTripLoop(stopConditions, conn, connMetricsSet, []byte(message))
 }
 
 // Handle a single TCP listener connection.  Echoes everything read from the
 // connection back to the peer.  This will return io.EOF if the client closes
 // connection.
-func handleConnection(ctx context.Context, stopConditions StopConditions, conn net.Conn) error {
+func handleConnection(
+	ctx context.Context,
+	stopConditions StopConditions,
+	connMetricsSet *ConnMetricsSet,
+	conn net.Conn) error {
 	defer func() {
 		conn.Close()
 	}()
@@ -228,7 +278,7 @@ func handleConnection(ctx context.Context, stopConditions StopConditions, conn n
 		return errors.Errorf("server unexpected EOF")
 	}
 
-	return runRoundTripLoop(stopConditions, conn, bytesRead)
+	return runRoundTripLoop(stopConditions, conn, connMetricsSet, bytesRead)
 }
 
 // firstIterationErr is a wrapping error used when the first iteration of
@@ -268,6 +318,7 @@ func (f *firstIterationErr) Unwrap() error {
 func runRoundTripLoop(
 	stopConditions StopConditions,
 	conn net.Conn,
+	connMetricsSet *ConnMetricsSet,
 	firstBytes []byte) error {
 	stopConditions.panicIfInvalid()
 	readWriter := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
@@ -289,12 +340,14 @@ func runRoundTripLoop(
 	var err error
 
 	stopOnIterations := stopConditions.NumIterations != 0
-	for i := 0; true; i++ {
+	var i int64
+	var cm *connMetrics
+	for ; ; i++ {
 		// check for graceful stop conditions
 		if done {
 			return nil
 		}
-		if stopOnIterations && i >= int(stopConditions.NumIterations) {
+		if stopOnIterations && i >= stopConditions.NumIterations {
 			return nil
 		}
 		select {
@@ -316,9 +369,12 @@ func runRoundTripLoop(
 		if stopOnIterations && done {
 			return errors.Errorf("unexpected EOF.  Should stop on iterations")
 		}
+
+		if cm == nil {
+			cm = connMetricsSet.NewConn()
+		}
+		cm.Count++
 	}
-	// shouldn't reach but compiler can't figure it out
-	return nil
 }
 
 // Write the provided message to the provided writer.

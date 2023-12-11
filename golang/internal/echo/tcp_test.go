@@ -41,6 +41,7 @@ func TestServe(t *testing.T) {
 	numClients := 500
 	iterationsPerClient := int64(100)
 	dialer := createDialer(100)
+	var connMetricsSet ConnMetricsSet
 
 	// create some contexts
 	// timeout
@@ -61,14 +62,15 @@ func TestServe(t *testing.T) {
 
 	serverGroup := errgroup.Group{}
 	serverGroup.Go(func() error {
-		return Accept(ctx, createServerStopConditions(), listener)
+		return Accept(ctx, createServerStopConditions(), &connMetricsSet, listener)
 	})
 
 	clientErr := RunClients(
 		ctx,
 		numClients,
 		createClientStopConditions(iterationsPerClient),
-		dialer)
+		dialer,
+		&connMetricsSet)
 	if clientErr != nil {
 		clientErr = errors.Errorf("client: %w", clientErr)
 	}
@@ -101,6 +103,9 @@ func TestServe(t *testing.T) {
 		require.NoError(joinedErr)
 	}
 	require.NoError(joinedErr)
+
+	// times 2 because we count for both client and server
+	require.Equal(2*int64(numClients)*iterationsPerClient, connMetricsSet.combined().Count)
 }
 
 // ECONNRESET occurs on MacOS because the queue of incoming TCP connection
