@@ -1,5 +1,5 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::io::{BufReader, Read, Write, Error, BufWriter};
+use std::io::{BufReader, Read, Write, Error, BufWriter, BufRead};
 use std::thread;
 
 const MAX_MESSAGE_SIZE: usize = 128;
@@ -12,7 +12,6 @@ pub trait Runnable {
     fn start(&self) -> Result<(), Error>;
 
     /// Perform one send/receive cycle with the other end of the socket.
-    /// Return the TcpStream if it's still open, create an error otherwise.
     fn handle_connection(thread_id: i32, stream: TcpStream) -> Result<(), Error>;
 }
 
@@ -29,7 +28,10 @@ impl Runnable for TcpServer {
         let mut thread_id = 0;
         for stream in listener.incoming() {
             let stream = stream.unwrap();
-            thread::spawn(move || TcpServer::handle_connection(thread_id, stream));
+            thread::spawn(||
+                // panic if there's an error
+                TcpServer::handle_connection(thread_id, stream).unwrap()
+            );
             thread_id += 1;
         }
         Ok(())
@@ -58,7 +60,10 @@ impl Runnable for TcpClient {
 
         for thread_id in 0..NUM_CLIENTS {
             let stream = TcpStream::connect(self.socket)?;
-            handles.push(thread::spawn(move || TcpClient::handle_connection(thread_id, stream)));
+            handles.push(thread::spawn(||
+                // panic if there's an error
+                TcpClient::handle_connection(thread_id, stream)).unwrap()
+            );
         }
 
         for handle in handles {
@@ -70,14 +75,12 @@ impl Runnable for TcpClient {
     /// Talk back and forth between the client and the server. The client will initiate a payload
     /// send it during each loop
     fn handle_connection(thread_id: i32, mut stream: TcpStream) -> Result<(), Error> {
+        let payload_str = format!("thread/{}", thread_id);
+        let payload = payload_str.as_bytes();
+        let mut buf: [u8; MAX_MESSAGE_SIZE] = [0; MAX_MESSAGE_SIZE];
         loop {
-            let payload_str = format!("thread/{}", thread_id);
-            let payload = payload_str.as_bytes();
             let expected_offset = BufWriter::new(&mut stream).write(payload)?;
-
-            let mut buf: [u8; MAX_MESSAGE_SIZE] = [0; MAX_MESSAGE_SIZE];
             let actual_offset = BufReader::new(&mut stream).read(&mut buf)?;
-
             assert_eq!(expected_offset, actual_offset);
             println!("interacted on thread/{}", thread_id);
         }
