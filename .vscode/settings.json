@@ -1,0 +1,16 @@
+{
+  "editor.formatOnSave": true,
+  "gradle.autoDetect": "on",
+  "gradle.nestedProjects": true,
+  "java.compile.nullAnalysis.mode": "automatic",
+  "java.configuration.runtimes": [
+    {
+      "name": "JavaSE-21",
+      "path": "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
+      "javadoc": "https://docs.oracle.com/en/java/javase/21/docs/api",
+      "default": true
+    }
+  ],
+  "java.format.settings.url": ".vscode/eclipse-java-google-style.xml",
+  "java.import.gradle.version": "8.5",
+}
