@@ -1,5 +1,5 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::io::{BufReader, Read, Write, Error, BufWriter, BufRead};
+use std::io::{BufReader, Read, Write, Error, BufWriter};
 use std::thread;
 
 const MAX_MESSAGE_SIZE: usize = 128;
@@ -62,8 +62,8 @@ impl Runnable for TcpClient {
             let stream = TcpStream::connect(self.socket)?;
             handles.push(thread::spawn(||
                 // panic if there's an error
-                TcpClient::handle_connection(thread_id, stream)).unwrap()
-            );
+                TcpClient::handle_connection(thread_id, stream).unwrap()
+            ));
         }
 
         for handle in handles {
