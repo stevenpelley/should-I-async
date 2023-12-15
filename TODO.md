@@ -16,9 +16,9 @@ Add server-side sleep
 ### Java
 many-round-trips test
 virtual threads test/demo
+figure out how to build, run, and run tests with incubating/preview structured concurrency and scoped values
 command app
 measure application performance
 
 ### Dev Tooling
-Devcontainer
-Can we auto-install plugins?  Is this included in devcontainer?  Are personal configurations allowed on top of that?
+Devcontainer up and running but WIP.

@@ -2,11 +2,15 @@
   "editor.formatOnSave": true,
   "gradle.autoDetect": "on",
   "gradle.nestedProjects": true,
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+  "java.import.gradle.java.home": "/usr/local/sdkman/candidates/java/current",
   "java.compile.nullAnalysis.mode": "automatic",
   "java.configuration.runtimes": [
     {
       "name": "JavaSE-21",
-      "path": "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
+      "path": "/usr/local/sdkman/candidates/java/current",
       "javadoc": "https://docs.oracle.com/en/java/javase/21/docs/api",
       "default": true
     }
