@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -44,6 +45,12 @@ public class ClientServerTest {
             serverFuture.get(5, TimeUnit.SECONDS);
         } finally {
             Files.deleteIfExists(path);
+        }
+    }
+
+    @Test
+    void testPreview() {
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
         }
     }
 }

@@ -17,4 +17,5 @@
   ],
   "java.format.settings.url": ".vscode/eclipse-java-google-style.xml",
   "java.import.gradle.version": "8.5",
+  "java.configuration.updateBuildConfiguration": "interactive",
 }

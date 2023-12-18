@@ -12,7 +12,7 @@
 			"installGradle": true,
 			"version": "21",
 			"jdkDistro": "open",
-			"gradleVersion": "7.5.1",
+			"gradleVersion": "8.5",
 			"mavenVersion": "3.8.6",
 			"antVersion": "1.10.12"
 		},
