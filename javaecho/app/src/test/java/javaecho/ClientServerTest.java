@@ -21,10 +21,12 @@ public class ClientServerTest {
         String socketFileName = "/tmp/should-I-async_javaecho_ClientServerTest";
         Path path = Path.of(socketFileName);
         var address = UnixDomainSocketAddress.of(path);
+        StopConditions neverStops = StopConditions.StopOnFuture(new CompletableFuture<>());
         CompletableFuture<Void> serverCompletesAfterBind = new CompletableFuture<>();
         try {
             var serverFuture = executor.submit(() -> {
-                var server = new Server(address, new Server.Injection(serverCompletesAfterBind));
+                var server = new Server(address, new Server.Injection(serverCompletesAfterBind),
+                        neverStops);
                 try {
                     server.listen();
                 } catch (Exception ex) {
@@ -40,9 +42,10 @@ public class ClientServerTest {
                 throw ex;
             }
 
-            var client = new Client("client1", address);
-            client.roundTrip();
-            serverFuture.get(5, TimeUnit.SECONDS);
+            var client = new Client("client1", address, StopConditions.StopOnIterations(20));
+            client.roundTripLoop();
+            // serverFuture.get(5, TimeUnit.SECONDS);
+            serverFuture.get(5, TimeUnit.HOURS);
         } finally {
             Files.deleteIfExists(path);
         }

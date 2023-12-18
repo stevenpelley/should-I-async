@@ -14,6 +14,7 @@ import com.google.common.base.Preconditions;
 public class Server {
     final SocketAddress address;
     final Injection injection;
+    final StopConditions stopConditions;
 
     public static class Injection {
         final CompletableFuture<Void> completeAfterBind;
@@ -23,9 +24,11 @@ public class Server {
         }
     }
 
-    public Server(SocketAddress address, Injection injection) {
-        this.address = address;
-        this.injection = injection;
+    public Server(SocketAddress address, Injection injection, StopConditions stopConditions) {
+        this.address = Preconditions.checkNotNull(address, "Server: null address");
+        this.injection = Preconditions.checkNotNull(injection, "Server: null injection");
+        this.stopConditions =
+                Preconditions.checkNotNull(stopConditions, "Server: null stopConditions");
     }
 
     public void listen() throws IOException {
@@ -36,14 +39,14 @@ public class Server {
         handle(sc);
     }
 
-    static void handle(SocketChannel socketChannel) throws IOException {
+    void handle(SocketChannel socketChannel) throws IOException {
         try (SocketChannel sc = socketChannel) {
             ByteBuffer buf = ByteBuffer.allocate(100);
-            Client.read(sc, buf, null);
+            Common.read(sc, buf, null);
             byte[] bytes = Arrays.copyOf(buf.array(), buf.position());
 
-            var isEOF = Client.roundTripX(sc, buf, bytes);
-            Preconditions.checkState(isEOF);
+            var isEOF = Common.roundTripLoop(sc, this.stopConditions, bytes, buf);
+            Preconditions.checkState(isEOF, "Server::handle: server should have received EOF");
         }
     }
 }
