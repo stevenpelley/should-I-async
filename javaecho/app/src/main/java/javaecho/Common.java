@@ -9,7 +9,8 @@ import com.google.common.base.Preconditions;
 
 public class Common {
     public static boolean roundTripLoop(SocketChannel sc, StopConditions stopConditions,
-            byte[] bytes, ByteBuffer buf) throws IOException {
+            byte[] bytes, ByteBuffer buf, ConnectionMetricsSet.ConnectionMetrics connectionMetrics)
+            throws IOException {
         for (long i = 0;; i++) {
             final long iFinal = i;
             if (stopConditions.iterations.map(iters -> iFinal >= iters).orElse(false)) {
@@ -26,6 +27,8 @@ public class Common {
             if (isEOF) {
                 return true;
             }
+
+            connectionMetrics.record();
         }
     }
 

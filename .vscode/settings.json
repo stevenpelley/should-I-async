@@ -18,4 +18,11 @@
   "java.format.settings.url": ".vscode/eclipse-java-google-style.xml",
   "java.import.gradle.version": "8.5",
   "java.configuration.updateBuildConfiguration": "interactive",
+  // uncomment to break on only specific exception types
+  // requires checking "Uncaught Exceptions" or "Caught Exceptions" in "Run and
+  // Debug"->Breakpoints
+  //"java.debug.settings.exceptionBreakpoint.exceptionTypes": [
+  //  "java.lang.NullPointerException",
+  //  "java.net.SocketException",
+  //],
 }
