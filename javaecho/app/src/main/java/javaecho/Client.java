@@ -6,6 +6,8 @@ import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.StructuredTaskScope;
@@ -18,6 +20,7 @@ public class Client {
     final StopConditions stopConditions;
     final ConnectionMetricsSet.ConnectionMetrics connectionMetrics;
     final ConnectArgs connectArgs;
+    SocketChannel socketChannel;
 
     public static class ConnectArgs {
         final Semaphore connectSemaphore;
@@ -51,14 +54,21 @@ public class Client {
         }
     }
 
-    SocketChannel connect()
-            throws IOException, InterruptedException, ConnectRetriesExhaustedException {
+    /**
+     * Either creates a connected SocketChannel, assigned to this.socketChannel, or throws.
+     * 
+     * @throws IOException
+     * @throws InterruptedException
+     * @throws ConnectRetriesExhaustedException
+     */
+    void connect() throws IOException, InterruptedException, ConnectRetriesExhaustedException {
         this.connectArgs.connectSemaphore.acquire();
         try {
             Exception lastException = null;
             for (int i = 0; i < this.connectArgs.maxRetries; i++) {
                 try {
-                    return SocketChannel.open(this.address);
+                    this.socketChannel = SocketChannel.open(this.address);
+                    return;
                 } catch (SocketException ex) {
                     lastException = ex;
                     Thread.sleep(this.connectArgs.retrySleep);
@@ -76,7 +86,7 @@ public class Client {
 
     void roundTripLoop()
             throws IOException, InterruptedException, ConnectRetriesExhaustedException {
-        try (SocketChannel sc = this.connect()) {
+        try (SocketChannel sc = this.socketChannel) {
             Common.roundTripLoop(sc, this.stopConditions, this.name.getBytes(), this.buf,
                     this.connectionMetrics);
         }
@@ -100,12 +110,29 @@ public class Client {
             ConnectionMetricsSet connectionMetricsSet, ConnectArgs connectArgs)
             throws InterruptedException, ExecutionException {
         int width = (int) (Math.log10(numClients) + 1);
-        try (var scope = new StructuredTaskScope.ShutdownOnFailure("Clients", threadFactory)) {
-            for (int i = 0; i < numClients; i++) {
-                final String clientName = String.format("%1$0" + width + "d", i);
+        final List<Client> clients = new ArrayList<>(numClients);
+        for (int i = 0; i < numClients; i++) {
+            final String clientName = String.format("%1$0" + width + "d", i);
+            clients.add(new Client(clientName, address, stopConditions, connectionMetricsSet,
+                    connectArgs));
+        }
+
+        // connect the clients
+        try (var scope =
+                new StructuredTaskScope.ShutdownOnFailure("ClientsConnect", threadFactory)) {
+            for (var client : clients) {
                 scope.fork(() -> {
-                    var client = new Client(clientName, address, stopConditions,
-                            connectionMetricsSet, connectArgs);
+                    client.connect();
+                    return null;
+                });
+            }
+            scope.join().throwIfFailed();
+        }
+
+        // run echo on clients
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure("Clients", threadFactory)) {
+            for (Client client : clients) {
+                scope.fork(() -> {
                     client.roundTripLoop();
                     return null;
                 });

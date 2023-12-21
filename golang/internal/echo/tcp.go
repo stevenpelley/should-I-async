@@ -75,7 +75,8 @@ func (d *Dialer) dialAndTest(ctx context.Context) (net.Conn, error) {
 }
 
 func (d *Dialer) dial(ctx context.Context) (net.Conn, error) {
-	return net.Dial(d.Network, d.Address)
+	dialer := net.Dialer{}
+	return dialer.DialContext(ctx, d.Network, d.Address)
 }
 
 // unexported
@@ -233,18 +234,34 @@ func RunClients(
 	dialer *Dialer,
 	connMetricsSet *ConnMetricsSet,
 ) error {
-
 	group, ctxGroup := errgroup.WithContext(ctx)
+	waitGroup := sync.WaitGroup{}
+	waitGroup.Add(numClients)
 
 	for i := 0; i < numClients; i++ {
 		i := i
 		group.Go(func() error {
+			// clients will wait after connecting and first using the connection
+			// (effectively testing the connection) if any client sees an error
+			// it must call Done() on the waitgroup to allow others to proceed.
+			reachedBarrier := false
+			defer func() {
+				if !reachedBarrier {
+					waitGroup.Done()
+				}
+			}()
+			barrierFunc := func() {
+				reachedBarrier = true
+				waitGroup.Done()
+				waitGroup.Wait()
+			}
 			return runClientWithRetry(
 				ctxGroup,
 				stopConditions,
 				dialer,
 				connMetricsSet,
-				fmt.Sprintf("client%v\n", i))
+				fmt.Sprintf("client%v\n", i),
+				barrierFunc)
 		})
 	}
 	return group.Wait()
@@ -256,11 +273,12 @@ func runClientWithRetry(
 	stopConditions StopConditions,
 	dialer *Dialer,
 	connMetricsSet *ConnMetricsSet,
-	message string) (err error) {
+	message string,
+	connectBarrier func()) (err error) {
 	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
 		i := i
-		err = runClient(ctx, stopConditions, dialer, connMetricsSet, message)
+		err = runClient(ctx, stopConditions, dialer, connMetricsSet, message, connectBarrier)
 		if isErrorRetriable(err) {
 			slog.Info("retrying runRoundTripLoop", "iteration", i, "err", err)
 			continue
@@ -287,7 +305,8 @@ func runClient(
 	stopConditions StopConditions,
 	dialer *Dialer,
 	connMetricsSet *ConnMetricsSet,
-	message string) (err error) {
+	message string,
+	connectBarrier func()) (err error) {
 	conn, err := dialer.dialAndTest(ctx)
 	if err != nil {
 		return errors.Wrap(err, 0)
@@ -300,7 +319,7 @@ func runClient(
 		conn.Close()
 	})()
 
-	return runRoundTripLoop(stopConditions, conn, connMetricsSet, []byte(message))
+	return runRoundTripLoop(stopConditions, conn, connMetricsSet, []byte(message), connectBarrier)
 }
 
 // Handle a single TCP listener connection.  Echoes everything read from the
@@ -328,7 +347,7 @@ func handleConnection(
 		return errors.Errorf("server unexpected EOF")
 	}
 
-	return runRoundTripLoop(stopConditions, conn, connMetricsSet, bytesRead)
+	return runRoundTripLoop(stopConditions, conn, connMetricsSet, bytesRead, func() {})
 }
 
 // firstIterationErr is a wrapping error used when the first iteration of
@@ -369,7 +388,8 @@ func runRoundTripLoop(
 	stopConditions StopConditions,
 	conn net.Conn,
 	connMetricsSet *ConnMetricsSet,
-	firstBytes []byte) error {
+	firstBytes []byte,
+	connectBarrier func()) error {
 	stopConditions.panicIfInvalid()
 	readWriter := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
@@ -424,6 +444,12 @@ func runRoundTripLoop(
 			cm = connMetricsSet.newConn()
 		}
 		cm.count++
+
+		if i == 0 {
+			// we've connected and used the connection once successfully.  Wait
+			// here for all clients to connect and use the connection once.
+			connectBarrier()
+		}
 	}
 }
 

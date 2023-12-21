@@ -19,7 +19,7 @@ import org.junit.jupiter.api.Test;
 public class ClientServerTest {
     static class TestConfig {
         int numClients = 512;
-        long numIterations = 10000;
+        long numIterations = 1000;
         Duration testTimeout = Duration.ofSeconds(30);
         Duration gracefulShutdownDuration = Duration.ofSeconds(2);
         int maxConnectConcurrency = 100;

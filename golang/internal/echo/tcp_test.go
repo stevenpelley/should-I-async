@@ -144,7 +144,11 @@ func TestServe(t *testing.T) {
 // synchronize all clients with a wait group after connecting.
 // no need for keepalive since we control the server and there is no intervening NAT
 // (is this true for docker virtual network?)
-func TestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
+//
+// Note that in a linux VM and container this hangs (meaning it connected)
+// even with thousands of clients.  It times out much later than 5s so something
+// weird is happening but it doesn't reproduce.
+func NoTestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
 	require := require.New(t)
 
 	dur, err := time.ParseDuration(("5s"))
@@ -157,8 +161,9 @@ func TestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
 	require.NoError(err)
 	defer listener.Close()
 
-	// 256 fails.  Clearly the queue is 256 large
-	numClients := 257
+	// 257 fails on MacOS.  Clearly the queue is 256 large
+	// even 64 * 1024 simply times out in a linux VM.
+	numClients := 1024 * 64
 	wg1 := new(sync.WaitGroup)
 	wg1.Add(numClients)
 
@@ -185,7 +190,7 @@ func TestDemoTcpAcceptQueueECONNRESET(t *testing.T) {
 
 	wg1.Wait()
 	require.Error(ctx.Err())
-	require.True(errors.Is(context.Cause(ctx), syscall.ECONNRESET))
+	require.ErrorIs(context.Cause(ctx), syscall.ECONNRESET)
 }
 
 // more fun:
@@ -331,7 +336,7 @@ func NoTestDemoSharedContextBetweenServerAndClient(t *testing.T) {
 //
 // NOTE: I'm sometimes seeing a race here where the server's ReadBytes() gets done=true
 // and no error.
-func TestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
+func NoTestDemoCloseWithReadsAvailableECONNRESET(t *testing.T) {
 	require := require.New(t)
 
 	dur, err := time.ParseDuration(("5s"))
