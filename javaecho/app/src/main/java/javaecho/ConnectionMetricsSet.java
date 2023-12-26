@@ -42,7 +42,7 @@ public class ConnectionMetricsSet {
 
             // Variance
             double variance = s.get().mapToDouble(i -> i).map(i -> i - this.averageCount)
-                    .map(i -> i * i).average().getAsDouble();
+                    .map(i -> i * i).average().orElse(0.0);
 
             // Standard Deviation
             this.StdDevCount = Math.sqrt(variance);

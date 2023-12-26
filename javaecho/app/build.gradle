@@ -25,6 +25,10 @@ dependencies {
 
     // This dependency is used by the application.
     implementation 'com.google.guava:guava:31.1-jre'
+    implementation 'commons-cli:commons-cli:1.6.0'
+    implementation 'com.fasterxml.jackson.core:jackson-core:2.16.0'
+    implementation 'com.fasterxml.jackson.core:jackson-annotations:2.16.0'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.16.0'
 }
 
 application {
@@ -55,4 +59,21 @@ eclipse.jdt.file.withProperties { props ->
 
 test {
     jvmArgs '--enable-preview'
+}
+
+run {
+    jvmArgs '--enable-preview'
+}
+
+jar {
+  duplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+  manifest {
+    attributes(
+      'Main-Class': 'javaecho.App'
+    )
+  }
+  // make it a fat jar
+  from {
+    configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+  }
 }

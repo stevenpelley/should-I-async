@@ -18,10 +18,9 @@ import (
 
 // top level flags
 var (
-	network              string
-	address              string
-	beforeRecordDuration time.Duration
-	trialDuration        time.Duration
+	network       string
+	address       string
+	trialDuration time.Duration
 )
 
 // client flags
@@ -37,15 +36,6 @@ var (
 func main() {
 	flag.StringVar(&network, "network", "tcp", "network from net package (e.g., tcp, udp, unix)")
 	flag.StringVar(&address, "address", ":8080", "network address, ip and port")
-	defaultBeforeRecordDuration, err := time.ParseDuration("2s")
-	if err != nil {
-		panic(err)
-	}
-	flag.DurationVar(
-		&beforeRecordDuration,
-		"beforeRecordDuration",
-		defaultBeforeRecordDuration,
-		"duration to run/warm up prior to starting metrics collection. Negative to never start collection")
 	defaultTrialDuration, err := time.ParseDuration("30s")
 	if err != nil {
 		panic(err)

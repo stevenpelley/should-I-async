@@ -3,12 +3,426 @@
  */
 package javaecho;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.SocketAddress;
+import java.net.UnixDomainSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+// Story time.
+// apache commons-cli is not my favorite. It's fairly minimal _except_ that it actually has a number
+// of underdocumented features that gives you hope that it'll do some heavy lifting for you.
+// examples:
+// 1. you can add default values, but they must be strings.
+// 2. CommandLine can parse options into a type for you but only a specific list of types.
+// Insufficient documentation
+// I'd like to be able to parse into enums. Also Duration.
+// 3. There's an Option builder but not much guidance on what, if any, is required or might be null.
+// 4. No discussed support for subcommands but since you get the leftover args I
+// don't think it's hard to do this yourself.
+//
+// I just _really_ don't want to mess around with annotations and having to
+// write my own type handler so I'm gonna stick with it but do all value
+// parsing, validation, and conversion myself.
+
 public class App {
-    public String getGreeting() {
-        return "Hello World!";
+    enum Network {
+        TCP("tcp"), UNIX("unix");
+
+        final String optionValueName;
+
+        Network(String optionValueName) {
+            this.optionValueName = optionValueName;
+        }
+
+        public static final Map<String, Network> valueNameToNetwork;
+        static {
+            valueNameToNetwork = new HashMap<>();
+            for (Network n : Network.values()) {
+                valueNameToNetwork.put(n.optionValueName, n);
+            }
+        }
+    }
+
+    enum ThreadType {
+        PLATFORM("platform"), VIRTUAL("virtual");
+
+        final String optionValueName;
+
+        ThreadType(String optionValueName) {
+            this.optionValueName = optionValueName;
+        }
+
+        public static final Map<String, ThreadType> valueNameToThreadType;
+        static {
+            valueNameToThreadType = new HashMap<>();
+            for (ThreadType t : ThreadType.values()) {
+                valueNameToThreadType.put(t.optionValueName, t);
+            }
+        }
+    }
+
+    class AppOptionValues {
+        Network network;
+        String address;
+        ThreadType threadType;
+    }
+
+    class ShutdownCoordinator {
+        // this lock is held by the application threads while running and
+        // shutting down gracefully. The shutdown hook will block on acquiring
+        // this lock, giving the app time for graceful shutdown. After a
+        // timeout the hook will halt and dump threads.
+        Lock runningLock = new ReentrantLock();
+
+        // the following may only be accessed in synchronized methods
+        //
+        // registration of tasks that the shutdown handler will first run, for
+        // example to interrupt threads that need interrupting.
+        // submitters should get a unique key from nextShutdownTaskKey using getAndIncrement
+        int nextShutdownTaskKey = 0;
+        Map<Integer, Runnable> shutdownTasks = new HashMap<>();
+        boolean isRegistrationOpen = true;
+
+        // register a new shutdown task. Returns a function that is called to
+        // unregister the shutdown task. Note that even after calling the
+        // unregistration function the task may still be run if the
+        // function is called after registration is closed.
+        synchronized Runnable registerShutdownTask(Runnable task) {
+            if (!isRegistrationOpen) {
+                throw new IllegalStateException(
+                        "registration is closed.  Technically this is due to shutdown/a signal "
+                                + "racing against startup of the application, but I don't feel like "
+                                + "handling it gracefully");
+            }
+
+            final int key = nextShutdownTaskKey++;
+            this.shutdownTasks.put(key, task);
+            return () -> {
+                synchronized (this) {
+                    if (!this.isRegistrationOpen) {
+                        return;
+                    }
+                }
+
+                this.shutdownTasks.remove(key);
+            };
+        }
+
+        synchronized void closeRegistration() {
+            this.isRegistrationOpen = false;
+        }
+
+        void registerShutdownHook(CompletableFuture<Void> gracefulShutdownFuture) {
+            // use a platform thread to avoid any virtual thread-blocking issues
+            // NB: this shutdown hook acquires a lock, which will not have been
+            // released by other threads in the event that we call exit(). We must
+            // ensure that the other thread unwinds
+            Runtime.getRuntime().addShutdownHook(Thread.ofPlatform().unstarted(() -> {
+                this.closeRegistration();
+                // signal the client or server to stop gracefully
+                gracefulShutdownFuture.complete(null);
+
+                // perform any tasks needed to allow graceful shutdown, e.g., interrupt threads.
+                for (Runnable task : this.shutdownTasks.values()) {
+                    task.run();
+                }
+
+                // give it some time to stop gracefully
+                final boolean gotLock;
+                try {
+                    gotLock = this.runningLock.tryLock(2, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException("shutdown thread interrupted.");
+                }
+
+                if (!gotLock) {
+                    System.err.println("failed to stop gracefully.  Dumping threads and halting.");
+                    java.util.Collection<java.lang.StackTraceElement[]> a1 =
+                            java.lang.Thread.getAllStackTraces().values();
+                    for (java.lang.StackTraceElement[] a2 : a1) {
+                        System.err.println("==========");
+                        for (java.lang.StackTraceElement a3 : a2) {
+                            System.err.println(a3.toString());
+                        }
+                    }
+                    Runtime.getRuntime().halt(2);
+                }
+
+                // success, exit
+                this.runningLock.unlock();
+            }));
+        }
+    }
+
+    // this Exception will be caught at the outermost level, its getMessage
+    // printed to stderr, and the process ended with a non-zero exit code.
+    //
+    // Doing this is preferable to printing to stderr directly and calling
+    // System.exit as it allows the stack to unwind, otherwise the watchdog
+    // shutdown hook cannot determine if it has exited gracefully.
+    class StdErrException extends RuntimeException {
+        StdErrException(String message) {
+            super(message);
+        }
+    }
+
+    AppOptionValues appOptionValues;
+    final ConnectionMetricsSet connectionMetricsSet = new ConnectionMetricsSet();
+    ThreadFactory threadFactory;
+    Thread timerThread;
+    StopConditions stopConditions;
+    Path addressPath;
+    SocketAddress address;
+    ShutdownCoordinator shutdownCoordinator = new ShutdownCoordinator();
+
+    void runApp(String[] args) {
+        createStopConditions();
+        this.shutdownCoordinator.registerShutdownHook(this.stopConditions.stop.orElseThrow(
+                () -> new IllegalStateException("graceful shutdown future must be present")));
+
+        Options options = new Options();
+        // default tcp
+        options.addOption(null, "network", true,
+                "socket network type: \"tcp\", \"unix\".  Default unix");
+        // default 8080
+        options.addOption(null, "address", true,
+                "socket network address: ip:port for tcp, file name for unix. Default /tmp/echo.sock");
+        // default virtual
+        options.addOption(null, "threadType", true,
+                "type of thread to use.  \"platform\" or \"virtual\".  Default virtual");
+
+        CommandLineParser parser = new DefaultParser();
+        CommandLine commandLine;
+        try {
+            commandLine = parser.parse(options, args, true);
+        } catch (ParseException ex) {
+            throwForStdErrMessage(ex.getMessage());
+            // help the compiler, otherwise it complains commandLine isn't initialized.
+            throw new RuntimeException(ex);
+        }
+
+        this.appOptionValues = new AppOptionValues();
+
+        this.appOptionValues.network =
+                parseEnum("network", Network.UNIX, commandLine, Network.valueNameToNetwork);
+        if (this.appOptionValues.network == Network.TCP) {
+            throwForStdErrMessage("tcp not yet supported");
+        }
+
+        String addressString = commandLine.getOptionValue("address");
+        this.appOptionValues.address = addressString == null ? "/tmp/echo.sock" : addressString;
+
+        this.appOptionValues.threadType = parseEnum("threadType", ThreadType.VIRTUAL, commandLine,
+                ThreadType.valueNameToThreadType);
+
+        createThreadFactory();
+        createSocketAddress();
+
+        boolean gotLock = this.shutdownCoordinator.runningLock.tryLock();
+        if (!gotLock) {
+            throw new IllegalStateException("failed to get running lock");
+        }
+        try {
+            String[] subArgs = commandLine.getArgs();
+            if (subArgs.length == 0) {
+                throwForStdErrMessage("Command required. \"client\" or \"server\"");
+            }
+            String cmd = subArgs[0];
+            switch (cmd) {
+                case "client":
+                    runClient(subArgs);
+                    break;
+                case "server":
+                    runServer(subArgs);
+                    break;
+                default:
+                    throwForStdErrMessage(String.format(
+                            "command \"%s\" not recognized.  Expecting \"client\" or \"server\"",
+                            cmd));
+            }
+
+            ConnectionMetricsSet.ConnectionStatistics statistics =
+                    this.connectionMetricsSet.getStatistics();
+            ObjectMapper mapper = new ObjectMapper();
+            try {
+                System.out.println(mapper.writeValueAsString(statistics));
+            } catch (JsonProcessingException ex) {
+                throw new RuntimeException("error serializing connection statistics", ex);
+            }
+        } finally {
+            this.shutdownCoordinator.runningLock.unlock();
+        }
+    }
+
+    long parseLong(String optionName, long defaultValue, CommandLine commandLine) {
+        String s = commandLine.getOptionValue(optionName);
+        long val = defaultValue;
+        try {
+            if (s != null) {
+                val = Long.parseLong(s);
+            }
+        } catch (NumberFormatException ex) {
+            throwForStdErrMessage(String.format("%s not a valid long: \"%s\"\n", optionName, s));
+        }
+        return val;
+    }
+
+    void cliArgsAssertNonnegative(String optionName, long val) {
+        if (val < 0) {
+            throwForStdErrMessage(
+                    String.format("%s must be nonnegative: \"%s\"\n", optionName, val));
+        }
+    }
+
+    <T> T parseEnum(String optionName, T defaultValue, CommandLine commandLine,
+            Map<String, T> nameToVal) {
+        String s = commandLine.getOptionValue(optionName);
+        T val = defaultValue;
+        if (s != null) {
+            val = nameToVal.get(s);
+            if (val == null) {
+                throwForStdErrMessage(String.format("unexpected %s: \"%s\". Possible values: %s\n",
+                        optionName, s, nameToVal.keySet()));
+            }
+        }
+        return val;
+    }
+
+    CommandLine parseSubCommand(String[] args, Options options) {
+        args = Arrays.copyOfRange(args, 1, args.length);
+
+        CommandLineParser parser = new DefaultParser();
+        final CommandLine commandLine;
+        try {
+            commandLine = parser.parse(options, args, true);
+        } catch (ParseException ex) {
+            throwForStdErrMessage(ex.getMessage());
+            // help the compiler
+            throw new RuntimeException(ex);
+        }
+
+        if (commandLine.getArgs().length > 0) {
+            throwForStdErrMessage(String.format("unexpected or invalid first args: %s",
+                    commandLine.getArgList()));
+        }
+
+        return commandLine;
+    }
+
+    void runClient(String[] args) {
+        Options options = new Options();
+        options.addOption(null, "numClients", true,
+                "number of client connections to run. Default 20");
+        CommandLine commandLine = parseSubCommand(args, options);
+
+        int numClients = Math.toIntExact(parseLong("numClients", 20, commandLine));
+        cliArgsAssertNonnegative("numClients", numClients);
+
+        try {
+            Client.runClients(numClients, this.threadFactory, this.address, this.stopConditions,
+                    this.connectionMetricsSet, new Client.ConnectArgs());
+        } catch (InterruptedException ex) {
+            // end gracefully
+        } catch (ExecutionException ex) {
+            throw new RuntimeException(ex);
+        }
+    }
+
+    void runServer(String[] args) {
+        try {
+            Files.deleteIfExists(this.addressPath);
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+        Options options = new Options();
+        // default 0
+        options.addOption(null, "sleepDuration", true,
+                "Duration (ms) to sleep before echoing.  Default 0");
+        CommandLine commandLine = parseSubCommand(args, options);
+
+        long sleepMillis = parseLong("sleepDuration", 0, commandLine);
+        cliArgsAssertNonnegative("sleepDuration", sleepMillis);
+        // TODO: not yet implemented
+        Duration sleepDuration = Duration.ofMillis(sleepMillis);
+
+        // no one will be watching but create anyways
+        var injection = new Server.Injection(new CompletableFuture<>());
+        try (var server = new Server(address, injection, this.stopConditions, Duration.ofSeconds(2),
+                connectionMetricsSet)) {
+            this.shutdownCoordinator.registerShutdownTask(() -> {
+                try {
+                    server.close();
+                } catch (IOException ex) {
+                    throw new UncheckedIOException(ex);
+                }
+            });
+            server.listenAndHandle(this.threadFactory);
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        } catch (InterruptedException ex) {
+            // stop gracefully
+        } catch (TimeoutException ex) {
+            throw new RuntimeException("server failed to end gracefully within timeout", ex);
+        }
+    }
+
+    void createThreadFactory() {
+        switch (this.appOptionValues.threadType) {
+            case ThreadType.VIRTUAL:
+                this.threadFactory = Thread.ofVirtual().name("echo").factory();
+                break;
+            case ThreadType.PLATFORM:
+                this.threadFactory = Thread.ofPlatform().name("echo").factory();
+                break;
+            default:
+                throw new IllegalStateException("switch should have handled all ThreadTypes");
+        }
+    }
+
+    void createStopConditions() {
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+        this.stopConditions = StopConditions.StopOnFuture(future);
+    }
+
+    void createSocketAddress() {
+        this.addressPath = Path.of(this.appOptionValues.address);
+        this.address = UnixDomainSocketAddress.of(this.addressPath);
+    }
+
+    /**
+     * Throw an Exception whose getMessage will be printed to stderr before quiting.
+     * 
+     * @param message
+     */
+    void throwForStdErrMessage(String message) {
+        throw new StdErrException(message);
     }
 
     public static void main(String[] args) {
-        System.out.println(new App().getGreeting());
+        try {
+            new App().runApp(args);
+        } catch (StdErrException ex) {
+            System.err.println(ex.getMessage());
+        }
     }
 }

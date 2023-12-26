@@ -32,6 +32,10 @@ public class Client {
             this.maxRetries = maxRetries;
             this.retrySleep = retrySleep;
         }
+
+        public ConnectArgs() {
+            this(new Semaphore(100), 5, Duration.ofMillis(1));
+        }
     }
 
     public Client(String name, SocketAddress address, StopConditions stopConditions,
