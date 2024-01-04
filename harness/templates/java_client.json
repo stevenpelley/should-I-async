@@ -7,7 +7,7 @@
         "--network",
         "unix",
         "--address",
-        "./echo.sock",
+        "./volume/echo.sock",
         "client",
         "--numClients",
         "{{.NumClients}}"

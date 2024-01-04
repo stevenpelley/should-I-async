@@ -234,6 +234,12 @@ func setup(
 		return
 	}
 
+	err = os.MkdirAll(ta.OutputDir, 0770)
+	if err != nil {
+		err = errors.Errorf("creating output directory and parent: %w", err)
+		return
+	}
+
 	outputFilePairs, err := createAllOutputFiles(ta.OutputDir, numCommands)
 	if err != nil {
 		return

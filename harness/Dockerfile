@@ -6,15 +6,17 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 WORKDIR /workspace
+COPY javaecho.jar .
+COPY goecho /workspace/
+COPY runner /workspace/
 
-COPY ./javaecho/app/build/libs/app.jar .
-
-ENTRYPOINT ["java",  "--enable-preview",  "-Djava.net.preferIPv4Stack=true", \
-    "-XX:FlightRecorderOptions=stackdepth=128", \
-    "-XX:+UnlockDiagnosticVMOptions", \
-    "-XX:+DebugNonSafepoints", \
-    "-XX:StartFlightRecording=delay=1s,duration=3s,name=StartFlightRecorder,filename=/mnt/mine/flight-recording.jfr", \
-    "-jar", "app.jar"]
+ENTRYPOINT ["./runner"]
+#ENTRYPOINT ["java",  "--enable-preview",  "-Djava.net.preferIPv4Stack=true", \
+#    "-XX:FlightRecorderOptions=stackdepth=128", \
+#    "-XX:+UnlockDiagnosticVMOptions", \
+#    "-XX:+DebugNonSafepoints", \
+#    "-XX:StartFlightRecording=delay=1s,duration=3s,name=StartFlightRecorder,filename=/mnt/mine/flight-recording.jfr", \
+#    "-jar", "app.jar"]
 
 #ENTRYPOINT ["java",  "--enable-preview", "-jar", "app.jar"]
 
