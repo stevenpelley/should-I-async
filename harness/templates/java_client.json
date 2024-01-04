@@ -1,0 +1,20 @@
+[
+    [
+        "java",
+        "--enable-preview",
+        "-jar",
+        "javaecho.jar",
+        "--network",
+        "unix",
+        "--address",
+        "./echo.sock",
+        "client",
+        "--numClients",
+        "{{.NumClients}}"
+    ],
+    [
+        "jcmd",
+        "{{.Pid}}",
+        "help"
+    ]
+]

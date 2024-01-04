@@ -46,7 +46,7 @@ public class ClientServerTest {
         // automatically shutdown the server. We'll verify afterwards that this was the case.
         try (final var scope = new StructuredTaskScope.ShutdownOnFailure("unit test",
                 Executors.defaultThreadFactory());
-                final var server = new Server(address,
+                final var server = new Server(address, Duration.ofMillis(0),
                         new Server.Injection(serverCompletesAfterBind), neverStops,
                         config.gracefulShutdownDuration, connectionMetricsSet)) {
             scope.fork(() -> {

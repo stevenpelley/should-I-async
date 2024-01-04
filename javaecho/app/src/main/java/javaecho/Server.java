@@ -21,6 +21,7 @@ public class Server implements AutoCloseable {
     final Injection injection;
     final StopConditions stopConditions;
     final Duration gracefulShutdownDuration;
+    final Duration sleepDuration;
     final ConnectionMetricsSet connectionMetricsSet;
     // set as soon as it is created so that this server can be closed from the
     // outside.
@@ -34,14 +35,17 @@ public class Server implements AutoCloseable {
         }
     }
 
-    public Server(SocketAddress address, Injection injection, StopConditions stopConditions,
-            Duration gracefulShutdownDuration, ConnectionMetricsSet connectionMetricsSet) {
+    public Server(SocketAddress address, Duration sleepDuration, Injection injection,
+            StopConditions stopConditions, Duration gracefulShutdownDuration,
+            ConnectionMetricsSet connectionMetricsSet) {
         this.address = Preconditions.checkNotNull(address, "Server: null address");
         this.injection = Preconditions.checkNotNull(injection, "Server: null injection");
         this.stopConditions =
                 Preconditions.checkNotNull(stopConditions, "Server: null stopConditions");
         this.gracefulShutdownDuration = Preconditions.checkNotNull(gracefulShutdownDuration,
                 "Server: null gracefulShutdownDuration");
+        this.sleepDuration =
+                Preconditions.checkNotNull(sleepDuration, "Server: null sleepDuration");
         this.connectionMetricsSet = connectionMetricsSet;
         this.serverSocketChannel = null;
     }
@@ -82,14 +86,14 @@ public class Server implements AutoCloseable {
         }
     }
 
-    void handle(SocketChannel socketChannel) throws IOException {
+    void handle(SocketChannel socketChannel) throws IOException, InterruptedException {
         try (SocketChannel sc = socketChannel) {
             ByteBuffer buf = ByteBuffer.allocate(100);
             Common.read(sc, buf, null);
             byte[] bytes = Arrays.copyOf(buf.array(), buf.position());
 
-            var isEOF = Common.roundTripLoop(sc, this.stopConditions, bytes, buf,
-                    this.connectionMetricsSet.newConnection());
+            var isEOF = Common.roundTripLoop(sc, this.stopConditions, this.sleepDuration, bytes,
+                    buf, this.connectionMetricsSet.newConnection());
             Preconditions.checkState(isEOF, "Server::handle: server should have received EOF");
         }
     }

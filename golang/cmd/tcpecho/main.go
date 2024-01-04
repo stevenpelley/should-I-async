@@ -18,9 +18,8 @@ import (
 
 // top level flags
 var (
-	network       string
-	address       string
-	trialDuration time.Duration
+	network string
+	address string
 )
 
 // client flags
@@ -36,15 +35,6 @@ var (
 func main() {
 	flag.StringVar(&network, "network", "tcp", "network from net package (e.g., tcp, udp, unix)")
 	flag.StringVar(&address, "address", ":8080", "network address, ip and port")
-	defaultTrialDuration, err := time.ParseDuration("30s")
-	if err != nil {
-		panic(err)
-	}
-	flag.DurationVar(
-		&trialDuration,
-		"trialDuration",
-		defaultTrialDuration,
-		"duration to run trial.  Negative to run indefinitely (until SIGTERM or SIGINT)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -98,7 +88,7 @@ func main() {
 		}
 		sem := semaphore.NewWeighted(100)
 		dialer := &echo.Dialer{Sem: sem, Network: network, Address: address}
-		err = echo.RunClients(ctx, numClients, stopConditions, dialer, &cm)
+		err := echo.RunClients(ctx, numClients, stopConditions, dialer, &cm)
 		if err != nil {
 			panic(err)
 		}
@@ -127,7 +117,7 @@ func main() {
 			}
 		}()
 
-		echo.Accept(ctx, stopConditions, &cm, listener)
+		echo.Accept(ctx, stopConditions, &cm, sleepDuration, listener)
 	default:
 		log.Fatalf("Unrecognized command %q.  Command must be one of: client, server", cmd)
 	}

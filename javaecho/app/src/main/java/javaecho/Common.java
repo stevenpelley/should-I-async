@@ -3,14 +3,16 @@ package javaecho;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import com.google.common.base.Preconditions;
 
 public class Common {
     public static boolean roundTripLoop(SocketChannel sc, StopConditions stopConditions,
-            byte[] bytes, ByteBuffer buf, ConnectionMetricsSet.ConnectionMetrics connectionMetrics)
-            throws IOException {
+            Duration sleepDuration, byte[] bytes, ByteBuffer buf,
+            ConnectionMetricsSet.ConnectionMetrics connectionMetrics)
+            throws IOException, InterruptedException {
         for (long i = 0;; i++) {
             final long iFinal = i;
             if (stopConditions.iterations.map(iters -> iFinal >= iters).orElse(false)) {
@@ -29,6 +31,9 @@ public class Common {
             }
 
             connectionMetrics.record();
+
+            // insert sleep between previous read and subsequent write
+            Thread.sleep(sleepDuration);
         }
     }
 

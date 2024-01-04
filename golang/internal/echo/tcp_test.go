@@ -62,7 +62,7 @@ func TestServe(t *testing.T) {
 
 	serverGroup := errgroup.Group{}
 	serverGroup.Go(func() error {
-		return Accept(ctx, createServerStopConditions(), &connMetricsSet, listener)
+		return Accept(ctx, createServerStopConditions(), &connMetricsSet, 0, listener)
 	})
 
 	clientErr := RunClients(

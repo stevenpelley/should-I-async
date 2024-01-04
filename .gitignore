@@ -2,3 +2,7 @@ golang/tcpecho
 rust/syncserver/target/*
 rust/syncserver/.idea/*
 javaecho/app/bin/**/*.class
+harness/goecho
+harness/javaecho.jar
+harness/runner
+harness/output

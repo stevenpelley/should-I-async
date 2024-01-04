@@ -91,8 +91,8 @@ public class Client {
     void roundTripLoop()
             throws IOException, InterruptedException, ConnectRetriesExhaustedException {
         try (SocketChannel sc = this.socketChannel) {
-            Common.roundTripLoop(sc, this.stopConditions, this.name.getBytes(), this.buf,
-                    this.connectionMetrics);
+            Common.roundTripLoop(sc, this.stopConditions, Duration.ofSeconds(0),
+                    this.name.getBytes(), this.buf, this.connectionMetrics);
         }
     }
 

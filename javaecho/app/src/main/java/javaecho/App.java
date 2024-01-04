@@ -362,13 +362,12 @@ public class App {
 
         long sleepMillis = parseLong("sleepDuration", 0, commandLine);
         cliArgsAssertNonnegative("sleepDuration", sleepMillis);
-        // TODO: not yet implemented
         Duration sleepDuration = Duration.ofMillis(sleepMillis);
 
         // no one will be watching but create anyways
         var injection = new Server.Injection(new CompletableFuture<>());
-        try (var server = new Server(address, injection, this.stopConditions, Duration.ofSeconds(2),
-                connectionMetricsSet)) {
+        try (var server = new Server(address, sleepDuration, injection, this.stopConditions,
+                Duration.ofSeconds(2), connectionMetricsSet)) {
             this.shutdownCoordinator.registerShutdownTask(() -> {
                 try {
                     server.close();

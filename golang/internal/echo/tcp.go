@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/go-errors/errors"
 	"github.com/montanaflynn/stats"
@@ -186,6 +187,7 @@ func Accept(
 	ctx context.Context,
 	stopConditions StopConditions,
 	connMetricsSet *ConnMetricsSet,
+	sleepDuration time.Duration,
 	listener net.Listener) (err error) {
 	// forces Accept to return when the context closes
 	defer context.AfterFunc(ctx, func() {
@@ -215,7 +217,7 @@ func Accept(
 			return &AcceptErr{childErr: err}
 		}
 		group.Go(func() error {
-			err := handleConnection(ctxGroup, stopConditions, connMetricsSet, conn)
+			err := handleConnection(ctxGroup, stopConditions, connMetricsSet, sleepDuration, conn)
 			if err != nil {
 				return errors.Errorf("first server handle err: %w", err)
 			}
@@ -319,7 +321,8 @@ func runClient(
 		conn.Close()
 	})()
 
-	return runRoundTripLoop(stopConditions, conn, connMetricsSet, []byte(message), connectBarrier)
+	return runRoundTripLoop(stopConditions, conn, time.Second*0, connMetricsSet,
+		[]byte(message), connectBarrier)
 }
 
 // Handle a single TCP listener connection.  Echoes everything read from the
@@ -329,6 +332,7 @@ func handleConnection(
 	ctx context.Context,
 	stopConditions StopConditions,
 	connMetricsSet *ConnMetricsSet,
+	sleepDuration time.Duration,
 	conn net.Conn) error {
 	defer func() {
 		conn.Close()
@@ -347,7 +351,8 @@ func handleConnection(
 		return errors.Errorf("server unexpected EOF")
 	}
 
-	return runRoundTripLoop(stopConditions, conn, connMetricsSet, bytesRead, func() {})
+	return runRoundTripLoop(stopConditions, conn, sleepDuration, connMetricsSet,
+		bytesRead, func() {})
 }
 
 // firstIterationErr is a wrapping error used when the first iteration of
@@ -387,6 +392,7 @@ func (f *firstIterationErr) Unwrap() error {
 func runRoundTripLoop(
 	stopConditions StopConditions,
 	conn net.Conn,
+	sleepDuration time.Duration,
 	connMetricsSet *ConnMetricsSet,
 	firstBytes []byte,
 	connectBarrier func()) error {
@@ -450,6 +456,10 @@ func runRoundTripLoop(
 			// here for all clients to connect and use the connection once.
 			connectBarrier()
 		}
+
+		// insert a sleep between the previous read and the next write if so
+		// configured.
+		time.Sleep(sleepDuration)
 	}
 }
 
