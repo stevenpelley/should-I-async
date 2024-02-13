@@ -1,330 +1,280 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
-	"text/template"
-	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/go-errors/errors"
 )
 
-// wrapper to run a client or server, run any processes for performance
-// monitoring and tracing, and forward sigterm/sigint
-//
-// accept a file path that will contain a json list of list of strings, each
-// the arguments to exec.
-// start the secondary processes, substituting in the PID or figuring out
-// env expansion.  The arguments, provided by the json doc, will include
-// output file locations so we don't have to do this here.
-// set up the signal handler.
-// start goroutines to block on each process and then signal a "done"
-// channel
-//
-// if first process finishes: start shutdown sequence.
-// if sigterm/sigint: start shutown sequence.
-// shutdown sequence:
-// sigterm all processes.
-// wait up to 3 seconds for all of them to finish, SIGKILL after 2
-
-type finishedProcess struct {
-	idx int
-	err error
-}
+// utility to run as docker process 1 and coordinate subcommands.  Intended for
+// use running a service to be profiled alongside profiling processes.  Fowards
+// SIGTERM to all subprocesses.
+// pass -h/-help or see usage below in code for more details
 
 func main() {
-	os.Exit(realMain())
+	err := realMain()
+	if err != nil {
+		slog.Error("error", "err", err)
+		os.Exit(2)
+	}
 }
 
-func parseCliArgs() (ta templateArg, inputFile string, testDuration time.Duration, err error) {
-	flag.StringVar(
-		&inputFile,
-		"input",
-		"",
-		"input json file providing list of list of strings as each processes' exec args")
-	flag.StringVar(
-		&ta.OutputDir,
-		"outputDir",
-		"",
-		"output directory for stdout and stderr files.")
-	flag.IntVar(&ta.NumClients, "numClients", 0, "number of clients when running as client")
-	flag.IntVar(&ta.ServerSleepDurationMillis, "serverSleepDurationMillis", 0, "server sleep duration in millis")
-	flag.DurationVar(&testDuration, "testDuration", 0, "test duration prior to sending processes SIGTERM, 0 or negative to run until interrupt")
+func realMain() (err error) {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	var help bool
+	flag.BoolVar(&help, "help", false, "displays help")
+	flag.BoolVar(&help, "h", false, "displays help")
+
+	flag.Usage = func() {
+		fmt.Fprintln(
+			flag.CommandLine.Output(),
+
+			`wrapper to run a client or server alongside processes for performance
+monitoring and tracing, and forward sigterm`)
+		flag.PrintDefaults()
+		fmt.Fprintln(flag.CommandLine.Output())
+		fmt.Fprint(
+			flag.CommandLine.Output(),
+			`Expects input on stdin as a json array of arrays of strings.  Each array of
+strings is the exec-style arguments to start a new process/command.  Every
+string will undergo shell-like variable expansion (${var} or $var) of
+environment variables defined by golang's os.Expand/ExpandEnv.  In addition,
+commands after the first will expand "CMD1_PID" to the pid of the first
+command.
+
+The output is stdout json logging of the execution trace, which includes the
+statuses and outputs of the started commands.
+If an error is encountered its information will be logged in an
+ERROR line and the exit code will be non-zero
+any event resulting in a returned error will be logged as WARN
+as each command completes a single INFO log line with msg
+"process complete" is logged.  Fields include "index" (command
+index), "process state", "pid", "stdout", and "stderr"
+
+stdout and stderr of the commands are buffered in memory.  This
+will need to change to run anything with large output
+
+The program will end immediately on any error prior to starting the first command.
+if there is an error starting any command all started commands will be
+SIGTERMed and all processes will be joined.
+if all command start successfully it will run until they all terminate.
+a SIGTERM to this process will SIGTERM all running processes in turn.
+Therefore if any of the commands run indefinitely you are expected to SIGTERM
+this process eventually`)
+		fmt.Fprintln(flag.CommandLine.Output())
+	}
 
 	flag.Parse()
 
-	if inputFile == "" {
-		err = errors.Errorf("--input required\n")
-		return
+	if help {
+		flag.Usage()
+		os.Exit(1)
 	}
-	if ta.OutputDir == "" {
-		err = errors.Errorf("--outputDir required\n")
-		return
-	}
-	if ta.NumClients <= 0 {
-		err = errors.Errorf("numClients must be positive")
-		return
-	}
-	if ta.ServerSleepDurationMillis < 0 {
-		err = errors.Errorf("serverSleepDurationMillis must be non-negative")
-		return
-	}
-	return
-}
 
-// these will be passed to the template executor
-// the first time Pid will be 0 (unset) so this must not be relied upon
-// in the first command -- it is this command's pid that will be assigned here
-type templateArg struct {
-	OutputDir                 string
-	NumClients                int
-	ServerSleepDurationMillis int
-	Pid                       int
-}
-
-// execute template and parse json
-func templateJson(data string, templateArg templateArg) ([][]string, error) {
-	var buf *bytes.Buffer = new(bytes.Buffer)
-	templ, err := template.New("").Parse(data)
+	ctx, _ := signal.NotifyContext(context.Background(), unix.SIGTERM)
+	ctx, cancelFunc := context.WithCancel(ctx)
+	defer cancelFunc()
+	commandArgs, err := readInputCommands()
 	if err != nil {
-		return nil, errors.Errorf("templateJson parsing template: %w", err)
+		return err
 	}
-	err = templ.Execute(buf, templateArg)
-	if err != nil {
-		return nil, errors.Errorf("templateJson executing template: %w", err)
-	}
-	processArgs := make([][]string, 0)
-	err = json.Unmarshal(buf.Bytes(), &processArgs)
-	if err != nil {
-		return nil, errors.Errorf("templateJson unmarshalling: %w", err)
-	}
-
-	return processArgs, nil
+	_, err = runCommands(ctx, cancelFunc, commandArgs, nil)
+	return err
 }
 
-func createOutputFile(outputDir string, cmdIdx int, suffix string) (*os.File, error) {
-	f, err := os.Create(filepath.Join(outputDir, fmt.Sprintf("%v-%v", cmdIdx, suffix)))
+// run commands defined by the parameters.  This is intended to abstract away
+// all the inputs for unit testing.
+func runCommands(
+	ctx context.Context,
+	cancelFunc context.CancelFunc,
+	commandArgs [][]string,
+	injection func([]*exec.Cmd)) ([]*exec.Cmd, error) {
+	// at this point if we see an error we'll still need to join all the processes.
+	commandStarter := NewCommandStarter(ctx, commandArgs)
+	err := commandStarter.startCommands()
 	if err != nil {
-		return nil, errors.Errorf("creating command output file: %v-%v: %w", cmdIdx, suffix, err)
+		slog.Info("terminating processes after error starting commands")
+		cancelFunc()
 	}
-	return f, nil
+	commands := commandStarter.commands
+
+	if injection != nil {
+		injection(commands)
+	}
+
+	slog.Warn("error starting commands", "err", err)
+
+	return commands, errors.Join(err, joinCommands(commands, cancelFunc))
 }
 
-type outputFiles struct {
-	stdout *os.File
-	stderr *os.File
+func readInputCommands() ([][]string, error) {
+	bytes, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return nil, errors.Errorf("reading stdin: %w", err)
+	}
+
+	var commandArgs [][]string
+	err = json.Unmarshal(bytes, &commandArgs)
+	if err != nil {
+		return nil, errors.Errorf("unmarshalling stdin json to [][]string: %w", err)
+	}
+
+	numCommands := len(commandArgs)
+	if numCommands == 0 {
+		return nil, errors.Errorf("json args must not be empty. Requires at least one command")
+	}
+
+	for i, args := range commandArgs {
+		if len(args) == 0 {
+			return nil, errors.Errorf("command %v json args must not be empty.", i)
+		}
+	}
+
+	return commandArgs, nil
 }
 
-func createAllOutputFiles(outputDir string, numCommands int) ([]outputFiles, error) {
-	success := false
-	ret := make([]outputFiles, numCommands)
-	defer func() {
-		if !success {
-			for i := 0; i < numCommands; i++ {
-				pair := ret[i]
-				if pair.stdout != nil {
-					pair.stdout.Close()
-				}
-				if pair.stderr != nil {
-					pair.stderr.Close()
-				}
+type commandStarter struct {
+	commandCtx  context.Context
+	commandArgs [][]string
+
+	commands []*exec.Cmd
+}
+
+// encapsulates the stdouts/stderrs writer type T and all of the inputs so that
+// starting a command can indicate simply an index within all the slices.
+func NewCommandStarter(
+	commandCtx context.Context,
+	commandArgs [][]string) *commandStarter {
+	return &commandStarter{
+		commandCtx:  commandCtx,
+		commandArgs: commandArgs,
+		commands:    make([]*exec.Cmd, len(commandArgs)),
+	}
+}
+
+func (cs *commandStarter) createCommand(idx int) *exec.Cmd {
+	expandFunc := func(s string) string {
+		switch s {
+		case "CMD1_PID":
+			if idx == 0 {
+				panic("expanding CMD1_PID in first command")
 			}
+			return strconv.Itoa(cs.commands[0].Process.Pid)
+		default:
+			return os.Getenv(s)
 		}
-	}()
-
-	for i := 0; i < numCommands; i++ {
-		stdout, err := createOutputFile(outputDir, i, "stdout")
-		if err != nil {
-			return nil, err
-		}
-		ret[i].stdout = stdout
-
-		stderr, err := createOutputFile(outputDir, i, "stderr")
-		if err != nil {
-			return nil, err
-		}
-		ret[i].stderr = stderr
 	}
 
-	// deactivate the defered close
-	success = true
-	return ret, nil
-}
-
-type commandKiller struct {
-	signal os.Signal
-}
-
-func (ck *commandKiller) setSignal(signal os.Signal) {
-	ck.signal = signal
-}
-
-func (ck *commandKiller) kill(command *exec.Cmd) error {
-	return command.Process.Signal(ck.signal)
-}
-
-func createCommand(
-	processCtx context.Context,
-	args []string,
-	outputFilePair outputFiles,
-	commandKiller *commandKiller) *exec.Cmd {
-	command := exec.CommandContext(processCtx, args[0], args[1:]...)
+	expandedArgs := make([]string, len(cs.commandArgs[idx]))
+	for i, arg := range cs.commandArgs[idx] {
+		expandedArgs[i] = os.Expand(arg, expandFunc)
+	}
+	command := exec.CommandContext(cs.commandCtx, expandedArgs[0], expandedArgs[1:]...)
 	command.Cancel = func() error {
-		return commandKiller.kill(command)
+		return command.Process.Signal(unix.SIGTERM)
 	}
-	command.WaitDelay = time.Second * 2
-	command.Stdout = outputFilePair.stdout
-	command.Stderr = outputFilePair.stderr
 
+	command.Stdout = &strings.Builder{}
+	command.Stderr = &strings.Builder{}
 	return command
 }
 
-// caller must defer callDefer() or callDefer() immediately
-func setup(
-	commandKiller *commandKiller) (
-	commands []*exec.Cmd,
-	testDuration time.Duration,
-	processCancelFunc context.CancelFunc,
-	callDefer func() error,
-	err error) {
+type startingCommandError struct {
+	commandIndex int
+	cause        error
+}
 
-	returnedDefer := make([]func() error, 0)
-	callDefer = func() error {
-		var err error
-		for _, f := range returnedDefer {
-			innerErr := f()
-			if innerErr != nil {
-				err = errors.Join(err, innerErr)
-			}
+func (err startingCommandError) Error() string {
+	return fmt.Sprintf("starting process %v: %v", err.commandIndex, err.cause)
+}
+
+func (err startingCommandError) Unwrap() error {
+	return err.cause
+}
+
+// starts the commands.  If any error is returned we will not attempt to clean
+// up and will return the list of started commands.  Entries may be nil if they
+// were not yet created.  It is the caller's responsibility to end and
+// join any started processes.
+func (cs *commandStarter) startCommands() error {
+	for idx := 0; idx < len(cs.commandArgs); idx++ {
+		command := cs.createCommand(idx)
+		cs.commands[idx] = command
+		slog.Info("starting command", "path", command.Path, "args", command.Args, "index", idx)
+		if err := command.Start(); err != nil {
+			return startingCommandError{commandIndex: idx, cause: err}
 		}
-		return err
+		slog.Info("started command", "path", command.Path, "args", command.Args,
+			"index", idx, "pid", command.Process.Pid)
 	}
-
-	ta, inputFile, td, err := parseCliArgs()
-	testDuration = td
-	if err != nil {
-		return
-	}
-
-	inputBytes, err := os.ReadFile(inputFile)
-	if err != nil {
-		return
-	}
-	inputString := string(inputBytes)
-
-	// templateArgs at this point do not have a PID.  We will use this only for
-	// starting the first command, at which point we will set the PID and
-	// execute the template again
-	processArgs, err := templateJson(inputString, ta)
-	if err != nil {
-		return
-	}
-
-	numCommands := len(processArgs)
-	if numCommands == 0 {
-		err = errors.Errorf("json args must not be empty. Requires at least one command")
-		return
-	}
-
-	err = os.MkdirAll(ta.OutputDir, 0770)
-	if err != nil {
-		err = errors.Errorf("creating output directory and parent: %w", err)
-		return
-	}
-
-	outputFilePairs, err := createAllOutputFiles(ta.OutputDir, numCommands)
-	if err != nil {
-		return
-	}
-	for _, pair := range outputFilePairs {
-		returnedDefer = append(returnedDefer, pair.stdout.Close)
-		returnedDefer = append(returnedDefer, pair.stderr.Close)
-	}
-
-	processCtx, cancel := context.WithCancel(context.Background())
-	processCancelFunc = cancel
-	returnedDefer = append(returnedDefer, func() error {
-		cancel()
-		return nil
-	})
-
-	commands = make([]*exec.Cmd, 1)
-
-	// start command 1 and get its pid
-	commands[0] = createCommand(processCtx, processArgs[0], outputFilePairs[0], commandKiller)
-	fmt.Fprintf(os.Stdout, "starting command 0. name: %v. Args: %v\n", commands[0].Path, commands[0].Args)
-	err = commands[0].Start()
-	if err != nil {
-		err = errors.Errorf("starting process %v: %w", 0, err)
-		return
-	}
-	firstPid := commands[0].Process.Pid
-
-	// replace templates in the subsequent commands to pass the pid
-	ta.Pid = firstPid
-	processArgs, err = templateJson(inputString, ta)
-	if err != nil {
-		return
-	}
-
-	if numCommands != len(processArgs) {
-		err = errors.Errorf(
-			"number of commands changed on 2nd invocation of template. Whatever you are doing is too complicated.  Previously %v now %v",
-			numCommands,
-			len(processArgs))
-		return
-	}
-
-	// on any error starting a process we'll still exit immediately and let the
-	// caller clean up.
-	for idx := 1; idx < numCommands; idx++ {
-		args := processArgs[idx]
-		command := createCommand(processCtx, args, outputFilePairs[idx], commandKiller)
-		commands = append(commands, command)
-		fmt.Fprintf(os.Stdout, "starting command %v. name; %v. Args: %v\n", idx, command.Path, command.Args)
-		err = command.Start()
-		if err != nil {
-			err = errors.Errorf("starting process %v. You must clean up processes!: %w", idx, err)
-			return
-		}
-	}
-
-	return
+	return nil
 }
 
 // must be called after cmd.Wait returns.  waitErr is the error returned by
 // cmd.Wait
-func didExitGracefully(cmd *exec.Cmd, waitErr error) bool {
-	// exited gracefully on no error/exit code 0 or exiting with SIGTERM
-	if waitErr != nil {
-		exitErr, ok := waitErr.(*exec.ExitError)
-		if !ok || exitErr.ExitCode() != 143 { // 143 is SIGTERM
-			return false
-		}
+func didExitGracefully(err error) bool {
+	if err == nil {
+		return true
 	}
-	return true
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		return false
+	}
+
+	// "exit code" implies the process "exited," meaning it returned in its
+	// code.  Terminating by signal is not exiting, and is not a
+	// platform-portable concept.  So here we use the exit error/process state's
+	// platform-specific "sys"
+	sys := exitErr.Sys()
+	waitStatus := sys.(syscall.WaitStatus)
+	return waitStatus.Signal() == unix.SIGTERM
 }
 
-func eventLoop(
-	commands []*exec.Cmd,
-	processCancelFunc context.CancelFunc,
-	testDuration time.Duration,
-	commandKiller commandKiller) error {
+type commandError struct {
+	commandIndex int
+	cause        error
+}
 
-	numCommands := len(commands)
+func (err commandError) Error() string {
+	return fmt.Sprintf("command index %v: %v", err.commandIndex, err.cause)
+}
+
+func (err commandError) Unwrap() error {
+	return err.cause
+}
+
+func joinCommands(commands []*exec.Cmd, cancelFunc context.CancelFunc) error {
+	type finishedProcess struct {
+		idx int
+		err error
+	}
 
 	// send the index and error and only write to stderr/out from the main
 	// goroutine as writing files is not threadsafe
 	processDoneCh := make(chan finishedProcess)
+	var startedProcessCount int
 	for idx, command := range commands {
+		// skip if never attempted to start or if start failed
+		if command == nil || command.Process == nil {
+			continue
+		}
+		startedProcessCount += 1
 		command := command
 		idx := idx
 		go func() {
@@ -332,125 +282,43 @@ func eventLoop(
 			processDoneCh <- finishedProcess{idx: idx, err: err}
 		}()
 	}
-
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
-
-	// initially nil.  Will be assigned when we start shutdown
-	var timeoutCh <-chan struct{}
-	startShutdown := func(signal os.Signal) context.CancelFunc {
-		if timeoutCh != nil {
-			return nil
-		}
-		// signal all remaining processes and start a SIGKILL timer
-		// SIGKILL timer is baked into all commands based on the cancel context
-		commandKiller.setSignal(signal)
-		processCancelFunc()
-
-		timeoutCtx, cancelTimeoutFunc := context.WithTimeout(context.Background(), time.Second*3)
-		timeoutCh = timeoutCtx.Done()
-		return cancelTimeoutFunc
+	if startedProcessCount == 0 {
+		return nil
 	}
 
-	testDurationContext := context.Background()
-	if testDuration > 0 {
-		var cancelTestDurationContext context.CancelFunc
-		testDurationContext, cancelTestDurationContext = context.WithTimeout(
-			context.Background(), testDuration)
-		defer cancelTestDurationContext()
-	}
+	cancelOnceFunc := sync.OnceFunc(func() {
+		slog.Info("terminating remaining processes")
+		cancelFunc()
+	})
 
-	finishedPids := make(map[int]struct{})
-	commandErrs := make([]error, numCommands)
-
-	isTimedOut := false
-	isSigInt := false
-loop:
+	var finishedCount int
+	var err error
 	for {
-		select {
-		case finishedProcess := <-processDoneCh:
-			idx := finishedProcess.idx
-			command := commands[idx]
-			err := finishedProcess.err
-			commandErrs[idx] = err
-			fmt.Fprintf(os.Stdout, "process %v exit status %v\n", idx, command.ProcessState.ExitCode())
-			if !didExitGracefully(command, err) {
-				fmt.Fprintf(os.Stderr,
-					"process %v nongraceful exit. exit status %v. err: %v\n",
-					idx, command.ProcessState.ExitCode(), err)
-			}
-			finishedPids[command.Process.Pid] = struct{}{}
-			if len(finishedPids) == numCommands {
-				break loop
-			}
-
-			// primary command terminated
-			if idx == 0 {
-				cancelTimeout := startShutdown(syscall.SIGTERM)
-				if cancelTimeout != nil {
-					defer cancelTimeout()
-				}
-			}
-
-		case sig := <-signalCh:
-			fmt.Fprintf(os.Stdout, "received signal %v\n", sig)
-			isSigInt = isSigInt || sig == os.Interrupt
-			cancelTimeout := startShutdown(sig)
-			if cancelTimeout != nil {
-				defer cancelTimeout()
-			}
-
-		case <-testDurationContext.Done():
-			cancelTimeout := startShutdown(syscall.SIGTERM)
-			if cancelTimeout != nil {
-				defer cancelTimeout()
-			}
-
-		case <-timeoutCh:
-			isTimedOut = true
-			break loop
+		finishedProcess := <-processDoneCh
+		idx := finishedProcess.idx
+		command := commands[idx]
+		stdout := command.Stdout.(*strings.Builder).String()
+		stderr := command.Stderr.(*strings.Builder).String()
+		slog.Info("process complete", "index", idx,
+			"process state", command.ProcessState.String(), "pid", command.ProcessState.Pid(),
+			"stdout", stdout, "stderr", stderr)
+		if !didExitGracefully(finishedProcess.err) {
+			slog.Warn("process nongraceful exit", "index", idx,
+				"process state", command.ProcessState.String(), "pid", command.ProcessState.Pid(),
+				"err", finishedProcess.err)
+			commandError := commandError{commandIndex: idx, cause: finishedProcess.err}
+			err = errors.Join(err, commandError)
+			// may be called multiple times.
+			cancelOnceFunc()
+		}
+		if idx == 0 {
+			cancelOnceFunc()
+		}
+		finishedCount += 1
+		if finishedCount == startedProcessCount {
+			break
 		}
 	}
 
-	// if we timed out waiting for children to return always end in error
-	if isTimedOut {
-		return errors.Errorf("timed out waiting for processes to finish")
-	}
-
-	// if any child ended in error we end in error
-	for idx, cmd := range commands {
-		err := commandErrs[idx]
-		if !didExitGracefully(cmd, err) {
-			status := cmd.ProcessState.ExitCode()
-			return errors.Errorf("command failed.  Idx %v exit code %v: %w", idx, status, err)
-		}
-	}
-
-	// if we were interrupted but all children somehow succeeded we should
-	// provide a failure exit code
-	if isSigInt {
-		return errors.Errorf("interrupted, all processes succeeded")
-	}
-
-	return nil
-}
-
-func realMain() int {
-	var commandKiller commandKiller = commandKiller{signal: syscall.SIGTERM}
-	commands, testDuration, processCancelFunc, callDefer, err := setup(&commandKiller)
-	// needs to be called even if there is an error
-	defer callDefer()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
-
-	// after this point we do not exit immediately on errors
-	err = eventLoop(commands, processCancelFunc, testDuration, commandKiller)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
-
-	return 0
+	return err
 }

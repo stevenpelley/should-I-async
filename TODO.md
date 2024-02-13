@@ -5,7 +5,6 @@ This file acts as a rough list and description of tasks to be done or ideas unde
 ## Next Steps
 
 ### Test Harness and Profile Tooling
-top level build all sub projects and create container
 Docker test harness
 Any necessary scripting to facilitate a test
 
@@ -25,15 +24,18 @@ platform threads.
 Compare these to golang.
 Vary number of clients and number of CPUs
 
-
 ### Golang
-Add server-side sleep
+(none)
 
 ### Java
 Add tcp echo.
-Add server-side sleep
 measure application performance
 add JFR
 
 ### Dev Tooling
-(done) Devcontainer up and running
+potentially streamline dockerfile so that devcontainer and test harness start
+from same image?
+
+### Scripting and Job Control
+Wrote a golang docker harness
+Continue with harness/harness.py to drive trials.  Simplify and complete it

@@ -10,11 +10,11 @@
         "./volume/echo.sock",
         "server",
         "--sleepDuration",
-        "{{.ServerSleepDurationMillis}}"
+        "${SERVER_SLEEP_MILLIS}"
     ],
     [
         "bash",
         "-c",
-        "echo {{.Pid}}"
+        "echo ${CMD1_PID}"
     ]
 ]

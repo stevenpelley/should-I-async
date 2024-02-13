@@ -10,11 +10,11 @@
         "./volume/echo.sock",
         "client",
         "--numClients",
-        "{{.NumClients}}"
+        "${NUM_CLIENTS}"
     ],
     [
         "jcmd",
-        "{{.Pid}}",
+        "${CMD1_PID}",
         "help"
     ]
 ]

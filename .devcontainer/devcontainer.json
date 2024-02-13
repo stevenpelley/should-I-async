@@ -6,7 +6,7 @@
 	"image": "mcr.microsoft.com/devcontainers/base:bullseye",
 	"features": {
 		"ghcr.io/devcontainers/features/go:1": {
-			"version": "1.21"
+			"version": "1.22"
 		},
 		"ghcr.io/devcontainers/features/java:1": {
 			"installGradle": true,
@@ -24,6 +24,10 @@
 			"moby": false,
 			"version": "24.0.7",
 			"dockerDashComposeVersion": "v2"
+		},
+		"ghcr.io/devcontainers/features/python:1": {
+			"version": 3.12,
+			"installTools": true
 		}
 	},
 	"customizations": {
@@ -31,7 +35,11 @@
 			"extensions": [
 				"vscjava.vscode-java-pack",
 				"golang.go",
-				"vscjava.vscode-gradle"
+				"vscjava.vscode-gradle",
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"ms-python.autopep8",
+				"ms-vscode.makefile-tools"
 			]
 		}
 	}

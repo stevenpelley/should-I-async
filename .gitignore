@@ -6,3 +6,4 @@ harness/goecho
 harness/javaecho.jar
 harness/runner
 harness/output*
+golang/runner

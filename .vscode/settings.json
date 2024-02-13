@@ -25,4 +25,8 @@
   //  "java.lang.NullPointerException",
   //  "java.net.SocketException",
   //],
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.autopep8",
+    "editor.formatOnSave": true
+  }
 }
