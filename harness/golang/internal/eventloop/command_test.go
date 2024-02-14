@@ -1,4 +1,4 @@
-package main
+package eventloop
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stevenpelley/should-I-async/harness/golang/internal/runnerio"
 	"github.com/stretchr/testify/require"
 )
 
@@ -87,17 +88,19 @@ func TestRunCommands(t *testing.T) {
 	defer cancelTimeout()
 	slog.Info("Test: 1 command with stdout and stderr")
 	ctx, cancelFunc := context.WithCancel(ctx)
-	commands, err := runCommands(
+	commands, err := RunCommands(
 		ctx,
 		cancelFunc,
+		nil,
 		[][]string{{
 			"bash",
 			"-c",
 			"echo -n \"this is stdout\"; echo -n \"this is stderr\" 1>&2"}},
-		nil)
+		[]runnerio.WriteCountCloser{newStringBuilderCloser()},
+		[]runnerio.WriteCountCloser{newStringBuilderCloser()})
 	require.NoError(err)
-	require.Equal("this is stdout", commands[0].Stdout.(*strings.Builder).String())
-	require.Equal("this is stderr", commands[0].Stderr.(*strings.Builder).String())
+	require.Equal("this is stdout", commands[0].Stdout.(*stringBuilderCloser).String())
+	require.Equal("this is stderr", commands[0].Stderr.(*stringBuilderCloser).String())
 
 	var startingCommandErr startingCommandError
 
@@ -121,11 +124,13 @@ func assertExitCode(t *testing.T, err error, expectedExitCode int) {
 
 func oneCommand(ctx context.Context, args []string, injection func([]*exec.Cmd)) error {
 	ctx, cancelFunc := context.WithCancel(ctx)
-	_, err := runCommands(
+	_, err := RunCommands(
 		ctx,
 		cancelFunc,
+		injection,
 		[][]string{args},
-		injection)
+		[]runnerio.WriteCountCloser{newStringBuilderCloser()},
+		[]runnerio.WriteCountCloser{newStringBuilderCloser()})
 	return err
 }
 
@@ -137,11 +142,13 @@ func oneCommandNoTimeout(args []string, injection func([]*exec.Cmd)) error {
 
 func twoCommands(ctx context.Context, args [][]string, injection func([]*exec.Cmd)) error {
 	ctx, cancelFunc := context.WithCancel(ctx)
-	_, err := runCommands(
+	_, err := RunCommands(
 		ctx,
 		cancelFunc,
+		injection,
 		args,
-		injection)
+		[]runnerio.WriteCountCloser{newStringBuilderCloser(), newStringBuilderCloser()},
+		[]runnerio.WriteCountCloser{newStringBuilderCloser(), newStringBuilderCloser()})
 	return err
 }
 
@@ -150,3 +157,15 @@ func twoCommandsNoTimeout(args [][]string, injection func([]*exec.Cmd)) error {
 	defer cancelTimeout()
 	return twoCommands(ctx, args, nil)
 }
+
+type stringBuilderCloser struct {
+	*strings.Builder
+}
+
+func newStringBuilderCloser() *stringBuilderCloser {
+	return &stringBuilderCloser{&strings.Builder{}}
+}
+
+func (*stringBuilderCloser) Close() error { return nil }
+
+func (*stringBuilderCloser) GetTotalBytesWritten() uint64 { return 0 }
