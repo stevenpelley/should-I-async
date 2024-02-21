@@ -1,17 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 
 	"golang.org/x/sys/unix"
 
+	"github.com/go-errors/errors"
 	"github.com/stevenpelley/should-I-async/harness/golang/internal/eventloop"
-	"github.com/stevenpelley/should-I-async/harness/golang/internal/runnerio"
+	"github.com/stevenpelley/should-I-async/harness/golang/internal/harnessio"
 )
 
 // utility to run as docker process 1 and coordinate subcommands.  Intended for
@@ -27,10 +31,7 @@ func main() {
 	}
 }
 
-func realMain() (err error) {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-
+func realMain() error {
 	var help bool
 	flag.BoolVar(&help, "help", false, "displays help")
 	flag.BoolVar(&help, "h", false, "displays help")
@@ -66,6 +67,11 @@ processes' output, one log line per line of their output.  This is all in a
 single flattened log for ease of use with docker, where stdin and stdout are
 readily available but files require mounting.
 
+Logging will contain attributes "app": "container1" to name log lines for this
+process, and "trial_config": <object> to name the run/trial.
+"trial_config" will take its value from environment variable TRIAL_CONFIG.  If
+empty/undefined then "trial_config" will be omitted.
+
 Useful log lines and jq queries:
 
 error handling is logged at WARN level, and an error encountered at the
@@ -94,18 +100,43 @@ jq -r 'select(.msg == "command output" and .command_index == 0 and .name == "std
 		os.Exit(1)
 	}
 
+	downstreamWriter := harnessio.NewLockingWriter(os.Stdout)
+
+	var handler slog.Handler
+	handler = slog.NewJSONHandler(harnessio.NewScanningWriter(downstreamWriter, bufio.ScanLines, []byte("\n")), nil)
+	newAttrs := make([]slog.Attr, 1)
+	newAttrs[0] = slog.String("app", "container1")
+
+	trialConfig := os.ExpandEnv("$TRIAL_CONFIG")
+	if len(trialConfig) > 0 {
+		var m map[string]interface{}
+		err := json.Unmarshal([]byte(trialConfig), &m)
+		if err != nil {
+			return errors.WrapPrefix(err, "unmarshaling TRIAL_CONFIG environment variable: ", 0)
+		}
+		newAttrs = append(newAttrs, slog.Any("trial_config", m))
+	}
+
+	handler = handler.WithAttrs(newAttrs)
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
 	ctx, _ := signal.NotifyContext(context.Background(), unix.SIGTERM)
 	ctx, cancelFunc := context.WithCancel(ctx)
 	defer cancelFunc()
-	commandArgs, err := runnerio.ReadInputCommands(os.Stdin)
+	commandArgs, err := harnessio.ReadInputCommands(os.Stdin)
 	if err != nil {
 		return err
 	}
-	stdouts := make([]runnerio.WriteCountCloser, len(commandArgs))
-	stderrs := make([]runnerio.WriteCountCloser, len(commandArgs))
+	stdouts := make([]io.Writer, len(commandArgs))
+	stderrs := make([]io.Writer, len(commandArgs))
 	for i := 0; i < len(commandArgs); i++ {
-		stdouts[i] = runnerio.NewOutputLoggerWriter(i, "stdout")
-		stderrs[i] = runnerio.NewOutputLoggerWriter(i, "stderr")
+		stdouts[i] = harnessio.CreateOutputWriter(
+			harnessio.CreateLogWrapper(logger, i, "stdout"),
+			downstreamWriter)
+		stderrs[i] = harnessio.CreateOutputWriter(
+			harnessio.CreateLogWrapper(logger, i, "stderr"),
+			downstreamWriter)
 	}
 	_, err = eventloop.RunCommands(ctx, cancelFunc, nil, commandArgs, stdouts, stderrs)
 	return err

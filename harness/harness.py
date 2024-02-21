@@ -40,46 +40,6 @@ import traceback
 
 # I add a nonstandard attribute _harness_label to futures so that they may be
 # labelled with a task identifier
-
-
-class SignalManager(object):
-    # handler will set signal_num and then set the event.  Others must wait for the
-    # event (or the event future that will be completed after the event) before
-    # reading the signal_num.  Since the signal_num is only written from the
-    # handler, and the handler is always called from the main thread, handlers do
-    # not need to synchronize against each other.
-    _signal_num = None
-    _signal_event = threading.Event()
-    _signal_event_future = None
-
-    def __init__(self, executor):
-        def signal_event_task():
-            self._signal_event.wait()
-            print("signal future: {}".format(self._signal_num))
-            return self._signal_num
-        self._signal_event_future = executor.submit(signal_event_task)
-        self._signal_event_future._harness_label = "signal"
-
-        signal.signal(signal.SIGTERM, self._handler)
-        signal.signal(signal.SIGINT, self._handler)
-
-    def _handler(self, sig_num, frame):
-        # not a race since only signal handlers will set and all signal handlers
-        # are run from the main thread
-        if self._signal_num is None:
-            self._signal_num = sig_num
-            self._signal_event.set()
-
-    def get_signal_future(self):
-        return self._signal_event_future
-
-    # should only be called from main thread
-    def close(self):
-        if self._signal_num is None:
-            self._signal_num = -99999
-            self._signal_event.set()
-
-
 class BgProcess(object):
     _p = None
     _future = None
@@ -96,6 +56,7 @@ class BgProcess(object):
             return result
 
         self._future = executor.submit(task)
+        self._future.add_done_callback(lambda: self._out_file.close())
         self._future._harness_label = future_label
 
     def future(self):
@@ -103,7 +64,6 @@ class BgProcess(object):
 
     def close(self):
         self._p.terminate()
-        self._out_file.close()
 
 
 def host_templates_path():

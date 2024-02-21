@@ -1,4 +1,4 @@
-package runnerio
+package harnessio
 
 import (
 	"encoding/json"

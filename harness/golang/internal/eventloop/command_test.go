@@ -2,6 +2,7 @@ package eventloop
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -10,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stevenpelley/should-I-async/harness/golang/internal/runnerio"
 	"github.com/stretchr/testify/require"
 )
 
@@ -96,11 +96,11 @@ func TestRunCommands(t *testing.T) {
 			"bash",
 			"-c",
 			"echo -n \"this is stdout\"; echo -n \"this is stderr\" 1>&2"}},
-		[]runnerio.WriteCountCloser{newStringBuilderCloser()},
-		[]runnerio.WriteCountCloser{newStringBuilderCloser()})
+		[]io.Writer{&strings.Builder{}},
+		[]io.Writer{&strings.Builder{}})
 	require.NoError(err)
-	require.Equal("this is stdout", commands[0].Stdout.(*stringBuilderCloser).String())
-	require.Equal("this is stderr", commands[0].Stderr.(*stringBuilderCloser).String())
+	require.Equal("this is stdout", commands[0].Stdout.(*strings.Builder).String())
+	require.Equal("this is stderr", commands[0].Stderr.(*strings.Builder).String())
 
 	var startingCommandErr startingCommandError
 
@@ -129,8 +129,8 @@ func oneCommand(ctx context.Context, args []string, injection func([]*exec.Cmd))
 		cancelFunc,
 		injection,
 		[][]string{args},
-		[]runnerio.WriteCountCloser{newStringBuilderCloser()},
-		[]runnerio.WriteCountCloser{newStringBuilderCloser()})
+		[]io.Writer{&strings.Builder{}},
+		[]io.Writer{&strings.Builder{}})
 	return err
 }
 
@@ -147,8 +147,8 @@ func twoCommands(ctx context.Context, args [][]string, injection func([]*exec.Cm
 		cancelFunc,
 		injection,
 		args,
-		[]runnerio.WriteCountCloser{newStringBuilderCloser(), newStringBuilderCloser()},
-		[]runnerio.WriteCountCloser{newStringBuilderCloser(), newStringBuilderCloser()})
+		[]io.Writer{&strings.Builder{}, &strings.Builder{}},
+		[]io.Writer{&strings.Builder{}, &strings.Builder{}})
 	return err
 }
 
@@ -157,15 +157,3 @@ func twoCommandsNoTimeout(args [][]string, injection func([]*exec.Cmd)) error {
 	defer cancelTimeout()
 	return twoCommands(ctx, args, nil)
 }
-
-type stringBuilderCloser struct {
-	*strings.Builder
-}
-
-func newStringBuilderCloser() *stringBuilderCloser {
-	return &stringBuilderCloser{&strings.Builder{}}
-}
-
-func (*stringBuilderCloser) Close() error { return nil }
-
-func (*stringBuilderCloser) GetTotalBytesWritten() uint64 { return 0 }

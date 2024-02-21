@@ -1,7 +1,7 @@
 build: build_runner build_go build_java build_docker
 
 build_runner:
-	go build -C ../golang -o ../harness/runner ./cmd/runner
+	go build -C ./golang -o ../runner ./cmd/runner
 
 build_go:
 	go build -C ../golang -o ../harness/goecho ./cmd/tcpecho
@@ -23,15 +23,14 @@ build_docker:
 run_%: templates/%.json
 	$(eval workspace := /workspace)
 	$(eval name := $*)
-	docker run \
-		--name $(name) \
-		--mount type=volume,source=harness_vol,destination=$(workspace)/volume \
-		--mount type=bind,source=./templates/,destination=$(workspace)/templates,readonly \
-		harness:1 \
-		--input $(workspace)/templates/$(name).json \
-		--outputDir $(workspace)/volume/output/$(name) \
-		--numClients=$(NUMCLIENTS) \
-		--serverSleepDurationMillis=$(SERVERSLEEPMILLIS) \
-		--testDuration=$(TESTDURATION)
-	docker cp $(name):$(workspace)/volume/output/$(name) output_$(name)
+	cat templates/$(name).json | \
+		timeout --preserve-status $(TRIAL_DURATION) \
+		docker run \
+			--interactive \
+			--name $(name) \
+			--mount type=volume,source=harness_vol,destination=$(workspace)/volume \
+			--env NUM_CLIENTS=$(NUM_CLIENTS) \
+			--env SERVER_SLEEP_MILLIS=$(SERVER_SLEEP_MILLIS) \
+			harness:1 \
+			--log-app-name inside
 	docker container rm $(name)

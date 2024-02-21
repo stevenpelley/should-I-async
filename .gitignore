@@ -4,6 +4,6 @@ rust/syncserver/.idea/*
 javaecho/app/bin/**/*.class
 harness/goecho
 harness/javaecho.jar
-harness/runner
+harness/container1
 harness/output*
-harness/golang/runner
+harness/golang/container1

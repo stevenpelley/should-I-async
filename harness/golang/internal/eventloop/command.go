@@ -3,6 +3,7 @@ package eventloop
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -11,7 +12,6 @@ import (
 	"syscall"
 
 	"github.com/go-errors/errors"
-	"github.com/stevenpelley/should-I-async/harness/golang/internal/runnerio"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,8 +31,8 @@ func RunCommands(
 	cancelFunc context.CancelFunc,
 	injection func([]*exec.Cmd),
 	commandArgs [][]string,
-	stdouts []runnerio.WriteCountCloser,
-	stderrs []runnerio.WriteCountCloser) ([]*exec.Cmd, error) {
+	stdouts []io.Writer,
+	stderrs []io.Writer) ([]*exec.Cmd, error) {
 	// at this point if we see an error we'll still need to join all the commands.
 	commandStarter := newCommandStarter(ctx, commandArgs, stdouts, stderrs)
 	err := commandStarter.startCommands()
@@ -53,8 +53,8 @@ func RunCommands(
 type commandStarter struct {
 	commandCtx  context.Context
 	commandArgs [][]string
-	stdouts     []runnerio.WriteCountCloser
-	stderrs     []runnerio.WriteCountCloser
+	stdouts     []io.Writer
+	stderrs     []io.Writer
 
 	commands []*exec.Cmd
 }
@@ -64,8 +64,8 @@ type commandStarter struct {
 func newCommandStarter(
 	commandCtx context.Context,
 	commandArgs [][]string,
-	stdouts []runnerio.WriteCountCloser,
-	stderrs []runnerio.WriteCountCloser) *commandStarter {
+	stdouts []io.Writer,
+	stderrs []io.Writer) *commandStarter {
 	return &commandStarter{
 		commandCtx:  commandCtx,
 		commandArgs: commandArgs,
@@ -142,7 +142,8 @@ func (cs *commandStarter) startCommands() error {
 }
 
 // must be called after cmd.Wait returns.  waitErr is the error returned by
-// cmd.Wait
+// cmd.Wait.  A command exited gracefully if it produced no error (exit code 0),
+// exited with 143/SIGTERM, or terminated (without exiting) from SIGTERM
 func didExitGracefully(err error) bool {
 	if err == nil {
 		return true
@@ -150,6 +151,9 @@ func didExitGracefully(err error) bool {
 	exitErr, ok := err.(*exec.ExitError)
 	if !ok {
 		return false
+	}
+	if exitErr.ExitCode() == 143 { // SIGTERM code
+		return true
 	}
 
 	// "exit code" implies the process "exited," meaning it returned in its
@@ -212,25 +216,22 @@ func joinCommands(commands []*exec.Cmd, cancelFunc context.CancelFunc) error {
 		finishedCommand := <-commandDoneCh
 		idx := finishedCommand.idx
 		command := commands[idx]
-		stdout := command.Stdout.(runnerio.WriteCountCloser)
-		stderr := command.Stderr.(runnerio.WriteCountCloser)
-		// the cmd does not return from Wait() until its stdout/stderr
-		// goroutines are done writing, so we may now close the write pipe,
-		// forcing them to flush/log and then block until logging completes.
-		if myerr := stdout.Close(); myerr != nil {
-			err = errors.Join(err, errors.Errorf("stdout err idx %v: %w", idx, err))
+		if stdout, ok := command.Stdout.(io.WriteCloser); ok {
+			if myerr := stdout.Close(); myerr != nil {
+				err = errors.Join(err, errors.Errorf("stdout err idx %v: %w", idx, myerr))
+			}
 		}
-		if myerr := stderr.Close(); myerr != nil {
-			err = errors.Join(err, errors.Errorf("stderr err idx %v: %w", idx, err))
+		if stderr, ok := command.Stderr.(io.WriteCloser); ok {
+			if myerr := stderr.Close(); myerr != nil {
+				err = errors.Join(err, errors.Errorf("stderr err idx %v: %w", idx, myerr))
+			}
 		}
 
 		slog.Info("command event",
 			"event", "terminated",
 			"command_index", idx,
 			"process state", command.ProcessState.String(),
-			"pid", command.ProcessState.Pid(),
-			"stdout_bytes", stdout.GetTotalBytesWritten(),
-			"stderr_bytes", stderr.GetTotalBytesWritten())
+			"pid", command.ProcessState.Pid())
 		if !didExitGracefully(finishedCommand.err) {
 			slog.Warn("command nongraceful exit", "command_index", idx,
 				"process state", command.ProcessState.String(), "pid", command.ProcessState.Pid(),

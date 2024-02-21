@@ -1,0 +1,4 @@
+github.com/stevenpelley/errors-fork v0.0.0-20240220195307-f791198c930e h1:HPBITP1An+/cXdZhfZvvG6RE+sterOQsPNlutQBfgiU=
+github.com/stevenpelley/errors-fork v0.0.0-20240220195307-f791198c930e/go.mod h1:GQukwlPni8qMeABlc2HSeHHFkPJrR3Gjl4bA7TfzZcw=
+github.com/stretchr/objx v0.5.0 h1:1zr/of2m5FGMsad5YfcqgdqdWrIhu+EBEJRhR1U7z/c=
+github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=
