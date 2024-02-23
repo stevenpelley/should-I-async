@@ -1,0 +1,1 @@
+[ -f .devcontainer/personalPostCreate.sh ] && bash .devcontainer/personalPostCreate.sh

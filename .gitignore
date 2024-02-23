@@ -7,3 +7,4 @@ harness/javaecho.jar
 harness/container1
 harness/output*
 harness/golang/container1
+.devcontainer/personalPostCreate.sh

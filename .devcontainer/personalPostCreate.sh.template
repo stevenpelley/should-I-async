@@ -1,0 +1,6 @@
+# modify and copy to .devcontainer/personalPostCreate.sh
+# this will run as part of postCreateCommand
+cd ~
+git clone https://github.com/stevenpelley/Dotfiles.git
+cd Dotfiles
+bash install.sh all
