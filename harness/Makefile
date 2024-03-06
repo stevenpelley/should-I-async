@@ -1,3 +1,5 @@
+SHELL=/bin/bash
+
 build: build_runner build_go build_java build_docker
 
 build_runner:
@@ -16,21 +18,28 @@ clean_docker:
 	docker volume prune
 
 build_docker:
-	docker build . --file ./Dockerfile -t harness:1
+	docker build . \
+		--no-cache \
+		--progress=plain \
+		--file ./Dockerfile -t harness:1 \
+		2>&1 | tee docker_build.log
 	docker volume create harness_vol
 
 # e.g., make run_java_client
-run_%: templates/%.json
+run_%: templates/%.sh
 	$(eval workspace := /workspace)
 	$(eval name := $*)
-	cat templates/$(name).json | \
-		timeout --preserve-status $(TRIAL_DURATION) \
-		docker run \
-			--interactive \
-			--name $(name) \
-			--mount type=volume,source=harness_vol,destination=$(workspace)/volume \
-			--env NUM_CLIENTS=$(NUM_CLIENTS) \
-			--env SERVER_SLEEP_MILLIS=$(SERVER_SLEEP_MILLIS) \
-			harness:1 \
-			--log-app-name inside
+	$(eval template_file := $<)
+	timeout --preserve-status $(TRIAL_DURATION) \
+	docker run \
+		--name $(name) \
+		--mount type=volume,source=harness_vol,destination=$(workspace)/volume \
+		--mount type=bind,source=$(PWD)/templates,destination=$(workspace)/templates,readonly \
+		--env NUM_CLIENTS=$(NUM_CLIENTS) \
+		--env SERVER_SLEEP_MILLIS=$(SERVER_SLEEP_MILLIS) \
+		harness:1 \
+		$(template_file)
+	mkdir -p output/
+	container_id=$$(docker container ls -lq); \
+		docker cp $${container_id}:/workspace/volume/output output/$${container_id}
 	docker container rm $(name)

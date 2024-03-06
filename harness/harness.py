@@ -3,12 +3,16 @@
 import concurrent.futures
 import json
 import os
-import signal
 import subprocess
 import threading
 import time
 import traceback
 
+# I abandoned this for now.  Bash is much shorter and simpler for running a
+# single timed test with a server and client.
+#
+# this will be a spot to sweep a parameter space which I still expect to be
+# easier from Python
 
 # TODO: this got more complicated than it needs to be:
 # as a driver I don't think we need to catch signals.  Or we can add it later.
@@ -223,6 +227,54 @@ class Trial(object):
             self.create_container_name("server"),
             self.create_container_name("client")])
         completed.check_returncode()
+
+
+class Trial(object):
+    _server_driver = None
+    _server_sleep_duration_millis = None
+    _client_driver = None
+    _client_num_clients = None
+    _test_duration_secs = None
+    # same data as a dict for json encoding
+    _trial_config = None
+
+    def __init__(self, server_driver, server_sleep_duration_millis,
+                 client_driver, client_num_clients, test_duration_secs):
+        self._server_driver = server_driver
+        self._server_sleep_duration_millis = server_sleep_duration_millis
+        self._client_driver = client_driver
+        self._client_num_clients = client_num_clients
+        self._test_duration_secs = test_duration_secs
+        self._trial_config = {
+            "server_driver": server_driver,
+            "server_sleep_duration_millis": server_sleep_duration_millis,
+            "client_driver": client_driver,
+            "client_num_clients": client_num_clients,
+            "test_duration_secs": test_duration_secs,
+        }
+
+    def _create_server_args(self, mode):
+        """Mode is either "client" or "server"
+        """
+        template_name = self._create_template_name(mode)
+        container_name = self.create_container_name(mode)
+        return [
+            "docker",
+            "run",
+            "--name", "{}".format(container_name),
+            "--mount", "type=volume,source=harness_vol,destination={}".format(
+                container_volume_path()),
+            "--mount", "type=bind,source={},destination={},readonly".format(
+                host_templates_path(), container_templates_path()),
+            "harness:1",
+            "--input", "{}.json".format(os.path.join(
+                container_templates_path(), template_name)),
+            "--outputDir", "{}".format(os.path.join(
+                container_output_path(), self._trial_name, mode)),
+            "--numClients", "{}".format(self._num_clients),
+            "--serverSleepDurationMillis", "{}".format(
+                self._server_sleep_duration_millis),
+        ]
 
 
 def main():

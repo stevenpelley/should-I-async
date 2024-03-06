@@ -1,4 +1,17 @@
 
+FROM debian:bullseye-20231218 as WAITPID
+RUN apt-get update
+RUN apt-get install -y git autopoint autoconf gettext flex bison libtool make
+WORKDIR /linux-util-build
+RUN git clone --depth 1 --branch stable/v2.40 https://github.com/util-linux/util-linux.git
+WORKDIR /linux-util-build/util-linux
+RUN ./autogen.sh
+RUN ./configure --disable-all-programs --enable-waitpid || cat config.log
+RUN make
+
+WORKDIR /waitn
+RUN git clone https://github.com/stevenpelley/waitn
+
 FROM debian:bullseye-20231218
 ENV JAVA_HOME=/opt/java/openjdk
 COPY --from=eclipse-temurin:21.0.1_12-jdk $JAVA_HOME $JAVA_HOME
@@ -8,9 +21,16 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 WORKDIR /workspace
 COPY javaecho.jar .
 COPY goecho /workspace/
-COPY runner /workspace/
+#COPY runner /workspace/
 
-ENTRYPOINT ["./runner"]
+COPY --from=WAITPID /linux-util-build/util-linux/waitpid .
+COPY --from=WAITPID /waitn/waitn/wait.bash .
+COPY wait_waitpid.bash .
+COPY inside_container_runner.bash .
+
+ENTRYPOINT ["/bin/bash", "inside_container_runner.bash"]
+
+#ENTRYPOINT ["./runner"]
 #ENTRYPOINT ["java",  "--enable-preview",  "-Djava.net.preferIPv4Stack=true", \
 #    "-XX:FlightRecorderOptions=stackdepth=128", \
 #    "-XX:+UnlockDiagnosticVMOptions", \
