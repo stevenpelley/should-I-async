@@ -422,6 +422,7 @@ public class App {
             new App().runApp(args);
         } catch (StdErrException ex) {
             System.err.println(ex.getMessage());
+            System.exit(1);
         }
     }
 }

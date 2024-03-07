@@ -19,6 +19,13 @@ clean_docker:
 
 build_docker:
 	docker build . \
+		--progress=plain \
+		--file ./Dockerfile -t harness:1 \
+		2>&1 | tee docker_build.log
+	docker volume create harness_vol
+
+build_docker_nocache:
+	docker build . \
 		--no-cache \
 		--progress=plain \
 		--file ./Dockerfile -t harness:1 \
