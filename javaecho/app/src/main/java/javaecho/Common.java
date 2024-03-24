@@ -33,7 +33,9 @@ public class Common {
             connectionMetrics.record();
 
             // insert sleep between previous read and subsequent write
-            Thread.sleep(sleepDuration);
+            if (sleepDuration.isPositive()) {
+                Thread.sleep(sleepDuration);
+            }
         }
     }
 

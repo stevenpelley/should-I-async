@@ -19,9 +19,12 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 WORKDIR /workspace
+RUN apt update
+RUN apt install -y linux-perf
+RUN ln -s /usr/bin/perf_5.10 /usr/bin/perf_6.6
+
 COPY javaecho.jar .
 COPY goecho /workspace/
-#COPY runner /workspace/
 
 COPY --from=WAITPID /linux-util-build/util-linux/waitpid .
 COPY --from=WAITPID /waitn/waitn/wait.bash .

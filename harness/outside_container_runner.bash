@@ -42,6 +42,7 @@ client_con_id=$(\
         --mount type=bind,source="$(pwd)"/templates,destination="${con_workspace}"/templates,readonly \
         --env NUM_CLIENTS="${NUM_CLIENTS}" \
         --env SERVER_SLEEP_MILLIS="${SERVER_SLEEP_MILLIS}" \
+        --cpus="1.0" \
         harness:1 \
         "${client_template}"
     )
@@ -64,3 +65,5 @@ docker container logs ${client_con_id} > output/client-con.stdout 2> output/clie
 docker container rm ${server_con_id}
 docker container rm ${client_con_id}
 docker volume rm harness_vol
+
+cat output/client-0.stdout
