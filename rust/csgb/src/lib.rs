@@ -171,7 +171,9 @@ mod imp {
 
     pub fn run_futex(num_pairs: u16, term: Arc<AtomicBool>) -> u64 {
         let num_threads = num_pairs * 2;
-        let futexes: Vec<MyFutex> = (0..num_pairs).map(|_| linux_futex::Futex::new(0)).collect();
+        let futexes: Vec<MyFutex> = (0..num_threads)
+            .map(|_| linux_futex::Futex::new(0))
+            .collect();
 
         return run(num_threads, term, |thread_id| {
             let is_first_in_pair = thread_id % 2 == 0;
