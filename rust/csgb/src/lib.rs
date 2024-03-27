@@ -28,18 +28,11 @@ mod imp {
     // Run the number of threads with the provided termination flag.
     // each thread will be provided a runner constructed from runner_generator
     //
-    // 'a: the lifetime of each generated runner is tied to this function.  Note
-    // that I'm attempting to say that the generated runner does not outlive this
-    // function and I'm not sure how this actually accomplishes this -- all the docs
-    // I find say that a lifetime annotation says the annotated trait must outlive
-    // the function.
-    //
-    // R: the generated runner is a Runner, can Send to another thread, and has lifetime 'a
-    //
+    // R: the generated runner is a Runner, can Send to another thread
     // F: the runner generator takes a thread_id and produces R
-    fn run<'a, F, R>(num_threads: u16, term: Arc<AtomicBool>, runner_generator: F) -> u64
+    fn run<F, R>(num_threads: u16, term: Arc<AtomicBool>, runner_generator: F) -> u64
     where
-        R: Runner + std::marker::Send + 'a,
+        R: Runner + std::marker::Send,
         F: Fn(u16) -> R,
     {
         return std::thread::scope(|scope| {
@@ -137,63 +130,50 @@ mod imp {
         });
     }
 
-    struct FutexRunner {
-        futex1: std::sync::Arc<linux_futex::Futex<linux_futex::Private>>,
-        futex2: std::sync::Arc<linux_futex::Futex<linux_futex::Private>>,
+    type MyFutex = linux_futex::Futex<linux_futex::Private>;
+    struct FutexRunner<'a> {
+        futex1: &'a MyFutex,
+        futex2: &'a MyFutex,
         is_first_in_pair: bool,
     }
-    impl FutexRunner {
-        fn wait_on_futex(futex: &linux_futex::Futex<linux_futex::Private>) {
+    impl<'a> FutexRunner<'a> {
+        fn wait_on_futex(futex: &MyFutex) {
             loop {
                 match futex.wait(0) {
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(linux_futex::WaitError::WrongValue) => {
-                        break;
-                    }
-                    Err(linux_futex::WaitError::Interrupted) => {
-                        continue;
-                    }
+                    Err(linux_futex::WaitError::Interrupted) => continue,
+                    _ => break,
                 }
             }
+            futex.value.store(0, Ordering::Release);
+        }
+
+        fn wake_futex(futex: &MyFutex) {
+            futex.value.store(1, Ordering::Release);
+            futex.wake(1);
         }
     }
-    impl Runner for FutexRunner {
-        fn one_iteration(self: &mut FutexRunner) {
+    impl<'a> Runner for FutexRunner<'a> {
+        fn one_iteration(&mut self) {
             if self.is_first_in_pair {
-                self.futex2.value.store(1, Ordering::Release);
-                self.futex2.wake(1);
-
+                FutexRunner::wake_futex(self.futex2);
                 FutexRunner::wait_on_futex(&self.futex1);
-                self.futex1.value.store(0, Ordering::Release);
             } else {
                 FutexRunner::wait_on_futex(&self.futex2);
-                self.futex2.value.store(0, Ordering::Release);
-
-                self.futex1.value.store(1, Ordering::Release);
-                self.futex1.wake(1);
+                FutexRunner::wake_futex(self.futex1);
             }
         }
-        fn on_cancelled(self: &mut FutexRunner) {
+        fn on_cancelled(&mut self) {
             // force the other to wake up no matter which we are.
-            self.futex1.value.store(1, Ordering::Release);
-            self.futex1.wake(1);
-            self.futex2.value.store(1, Ordering::Release);
-            self.futex2.wake(1);
+            FutexRunner::wake_futex(self.futex1);
+            FutexRunner::wake_futex(self.futex2);
         }
     }
 
     pub fn run_futex(num_pairs: u16, term: Arc<AtomicBool>) -> u64 {
         let num_threads = num_pairs * 2;
-        let mut futexes: Vec<std::sync::Arc<linux_futex::Futex<linux_futex::Private>>> =
-            Vec::with_capacity(num_threads as usize);
-        for _ in 0..num_threads {
-            let mut_futexes = &mut futexes;
-            mut_futexes.push(std::sync::Arc::new(linux_futex::Futex::new(0)));
-        }
+        let futexes: Vec<MyFutex> = (0..num_pairs).map(|_| linux_futex::Futex::new(0)).collect();
 
-        return run(num_threads, term, move |thread_id| {
+        return run(num_threads, term, |thread_id| {
             let is_first_in_pair = thread_id % 2 == 0;
             let base_idx = if is_first_in_pair {
                 thread_id
@@ -201,12 +181,12 @@ mod imp {
                 thread_id - 1
             } as usize;
             // each thread needs its own references to the relevant futexes
-            let futex1 = futexes[base_idx].clone();
-            let futex2 = futexes[base_idx + 1].clone();
+            let futex1 = &futexes[base_idx];
+            let futex2 = &futexes[base_idx + 1];
             return FutexRunner {
-                futex1: futex1,
-                futex2: futex2,
-                is_first_in_pair: is_first_in_pair,
+                futex1,
+                futex2,
+                is_first_in_pair,
             };
         });
     }
@@ -270,8 +250,8 @@ mod imp {
             let is_first_in_pair = thread_id % 2 == 0;
             let socket = &sockets[thread_id as usize];
             return SocketRunner {
-                socket: socket,
-                is_first_in_pair: is_first_in_pair,
+                socket,
+                is_first_in_pair,
                 buf: [0],
             };
         });
