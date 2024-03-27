@@ -28,5 +28,9 @@
   "[python]": {
     "editor.defaultFormatter": "ms-python.autopep8",
     "editor.formatOnSave": true
-  }
+  },
+  "rust-analyzer.linkedProjects": [
+    "rust/syncserver/Cargo.toml",
+    "rust/csgb/Cargo.toml"
+  ]
 }

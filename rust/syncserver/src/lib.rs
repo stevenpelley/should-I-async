@@ -1,5 +1,5 @@
+use std::io::{BufReader, BufWriter, Error, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::io::{BufReader, Read, Write, Error, BufWriter};
 use std::thread;
 
 const MAX_MESSAGE_SIZE: usize = 128;
@@ -7,7 +7,6 @@ const NUM_CLIENTS: i32 = 10;
 
 /// Trait defining behavior for the server/client
 pub trait Runnable {
-
     /// Start the server/client. The implementation of this function is expected to loop infinitely
     fn start(&self) -> Result<(), Error>;
 
@@ -18,7 +17,7 @@ pub trait Runnable {
 // TcpServer: Start the listener and delegate incoming connections to other threads.
 
 pub struct TcpServer {
-    pub socket: SocketAddr
+    pub socket: SocketAddr,
 }
 
 // Runnable handler for the TCP server
@@ -28,16 +27,15 @@ impl Runnable for TcpServer {
         let mut thread_id = 0;
         for stream in listener.incoming() {
             let stream = stream.unwrap();
-            thread::spawn(||
+            thread::spawn(move ||
                 // panic if there's an error
-                TcpServer::handle_connection(thread_id, stream).unwrap()
-            );
+                TcpServer::handle_connection(thread_id, stream).unwrap());
             thread_id += 1;
         }
         Ok(())
     }
 
-    fn handle_connection(_thread_id: i32, mut stream: TcpStream) -> Result<(),Error> {
+    fn handle_connection(_thread_id: i32, mut stream: TcpStream) -> Result<(), Error> {
         loop {
             let mut buf: [u8; MAX_MESSAGE_SIZE] = [0; MAX_MESSAGE_SIZE];
             let offset = BufReader::new(&mut stream).read(&mut buf)?;
@@ -49,21 +47,19 @@ impl Runnable for TcpServer {
 // TcpClient. Will launch NUM_CLIENTS threads each talking to the client.
 
 pub struct TcpClient {
-    pub socket: SocketAddr
+    pub socket: SocketAddr,
 }
 
 impl Runnable for TcpClient {
-
     /// Launch NUM_CLIENTS each running on their own thread and interacting with the server
     fn start(&self) -> Result<(), Error> {
         let mut handles = Vec::with_capacity(NUM_CLIENTS as usize);
 
         for thread_id in 0..NUM_CLIENTS {
             let stream = TcpStream::connect(self.socket)?;
-            handles.push(thread::spawn(||
+            handles.push(thread::spawn(move ||
                 // panic if there's an error
-                TcpClient::handle_connection(thread_id, stream).unwrap()
-            ));
+                TcpClient::handle_connection(thread_id, stream).unwrap()));
         }
 
         for handle in handles {
@@ -78,6 +74,7 @@ impl Runnable for TcpClient {
         let payload_str = format!("thread/{}", thread_id);
         let payload = payload_str.as_bytes();
         let mut buf: [u8; MAX_MESSAGE_SIZE] = [0; MAX_MESSAGE_SIZE];
+        std::thread::park();
         loop {
             let expected_offset = BufWriter::new(&mut stream).write(payload)?;
             let actual_offset = BufReader::new(&mut stream).read(&mut buf)?;

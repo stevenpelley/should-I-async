@@ -1,6 +1,8 @@
 golang/tcpecho
 rust/syncserver/target/*
 rust/syncserver/.idea/*
+rust/csgb/target/*
+rust/csgb/.idea/*
 javaecho/app/bin/**/*.class
 harness/goecho
 harness/javaecho.jar
