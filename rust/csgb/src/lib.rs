@@ -3,15 +3,14 @@ pub use imp::run_sleep;
 pub use imp::run_socket;
 pub use imp::run_yield;
 
+mod exec;
+
 mod imp {
     use core::panic;
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
+        sync::atomic::{AtomicBool, Ordering},
     };
 
     // A runner provides methods (and state) to run one iteration and to gracefully
@@ -30,7 +29,7 @@ mod imp {
     //
     // R: the generated runner is a Runner, can Send to another thread
     // F: the runner generator takes a thread_id and produces R
-    fn run<F, R>(num_threads: u16, term: Arc<AtomicBool>, runner_generator: F) -> u64
+    fn run<F, R>(num_threads: u16, term: &AtomicBool, runner_generator: F) -> u64
     where
         R: Runner + std::marker::Send,
         F: Fn(u16) -> R,
@@ -39,12 +38,11 @@ mod imp {
             let mut handles: Vec<std::thread::ScopedJoinHandle<u64>> =
                 Vec::with_capacity(num_threads as usize);
             for thread_id in 0..num_threads {
-                let thread_term = Arc::clone(&term);
                 let mut thread_runner = runner_generator(thread_id);
                 handles.push(scope.spawn(move || {
                     let mut count: u64 = 0;
                     loop {
-                        if thread_term.load(Ordering::Relaxed) {
+                        if term.load(Ordering::Relaxed) {
                             thread_runner.on_cancelled();
                             return count;
                         }
@@ -86,7 +84,7 @@ mod imp {
         }
     }
 
-    pub fn run_yield(num_threads: u16, term: Arc<AtomicBool>) -> u64 {
+    pub fn run_yield(num_threads: u16, term: &AtomicBool) -> u64 {
         return run(num_threads, term, |_| {
             return YieldRunner {};
         });
@@ -122,7 +120,7 @@ mod imp {
         }
     }
 
-    pub fn run_sleep(num_threads: u16, sleep_ns: &u64, term: Arc<AtomicBool>) -> u64 {
+    pub fn run_sleep(num_threads: u16, sleep_ns: &u64, term: &AtomicBool) -> u64 {
         return run(num_threads, term, |_| {
             return SleepRunner {
                 thread_sleep_ns: *sleep_ns,
@@ -169,7 +167,7 @@ mod imp {
         }
     }
 
-    pub fn run_futex(num_pairs: u16, term: Arc<AtomicBool>) -> u64 {
+    pub fn run_futex(num_pairs: u16, term: &AtomicBool) -> u64 {
         let num_threads = num_pairs * 2;
         let futexes: Vec<MyFutex> = (0..num_threads)
             .map(|_| linux_futex::Futex::new(0))
@@ -182,12 +180,9 @@ mod imp {
             } else {
                 thread_id - 1
             } as usize;
-            // each thread needs its own references to the relevant futexes
-            let futex1 = &futexes[base_idx];
-            let futex2 = &futexes[base_idx + 1];
             return FutexRunner {
-                futex1,
-                futex2,
+                futex1: &futexes[base_idx],
+                futex2: &futexes[base_idx + 1],
                 is_first_in_pair,
             };
         });
@@ -239,7 +234,7 @@ mod imp {
         }
     }
 
-    pub fn run_socket(num_pairs: u16, term: Arc<AtomicBool>) -> u64 {
+    pub fn run_socket(num_pairs: u16, term: &AtomicBool) -> u64 {
         let num_threads = num_pairs * 2;
         // adjacent sockets whose indices / 2 (trunc) produce the same value are
         // connected to each other
@@ -282,7 +277,7 @@ mod imp {
         #[test]
         fn test_futex() {
             let term = term_after(Duration::from_secs(1));
-            let num_echoes = run_futex(100, term);
+            let num_echoes = run_futex(100, &term);
             assert!(num_echoes > 0);
         }
     }

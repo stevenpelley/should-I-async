@@ -32,6 +32,12 @@
 			"installTools": true
 		}
 	},
+	"runArgs": [
+		"--privileged"
+	],
+	"mounts": [
+		"source=/,target=/host-root,type=bind,consistency=cached"
+	],
 	"customizations": {
 		"vscode": {
 			"extensions": [

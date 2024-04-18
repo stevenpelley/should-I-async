@@ -64,20 +64,20 @@ fn main() {
     let total_iterations: u64 = match matches.subcommand() {
         Some(("yield", sub_m)) => {
             let num_threads = sub_m.get_one::<u16>("THREADS").unwrap();
-            csgb::run_yield(*num_threads, Arc::clone(&term))
+            csgb::run_yield(*num_threads, &term)
         }
         Some(("sleep", sub_m)) => {
             let num_threads = sub_m.get_one::<u16>("THREADS").unwrap();
             let sleep_ns = sub_m.get_one::<u64>("SLEEP_NS").unwrap();
-            csgb::run_sleep(*num_threads, sleep_ns, Arc::clone(&term))
+            csgb::run_sleep(*num_threads, sleep_ns, &term)
         }
         Some(("futex", sub_m)) => {
             let num_thread_pairs = sub_m.get_one::<u16>("THREAD_PAIRS").unwrap();
-            csgb::run_futex(*num_thread_pairs, Arc::clone(&term))
+            csgb::run_futex(*num_thread_pairs, &term)
         }
         Some(("socket", sub_m)) => {
             let num_thread_pairs = sub_m.get_one::<u16>("THREAD_PAIRS").unwrap();
-            csgb::run_socket(*num_thread_pairs, Arc::clone(&term))
+            csgb::run_socket(*num_thread_pairs, &term)
         }
         _ => {
             std::unreachable!("subcommand was required");
