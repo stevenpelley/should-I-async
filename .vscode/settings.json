@@ -32,5 +32,6 @@
   "rust-analyzer.linkedProjects": [
     "rust/syncserver/Cargo.toml",
     "rust/csgb/Cargo.toml"
-  ]
+  ],
+  "sqlite.logLevel": "DEBUG"
 }

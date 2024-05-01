@@ -2,7 +2,7 @@ use csgb;
 
 use std::sync::{atomic::AtomicBool, Arc};
 
-use clap::{arg, Command};
+use clap::{arg, ArgAction, Command};
 
 enum ThreadArg {
     NumThreads,
@@ -25,7 +25,15 @@ fn cli() -> Command {
     Command::new("csgb")
         .about("Context Switches Go Brrr")
         .subcommand_required(true)
-        .arg_required_else_help(true)
+        .arg(
+            clap::Arg::new("sync")
+                .short('s')
+                .long("sync")
+                .required(false)
+                .action(ArgAction::SetTrue)
+                // does not take a value
+                .num_args(0),
+        )
         .subcommand(subcommand(
             "yield",
             "threads yield repeatedly",
@@ -61,23 +69,31 @@ fn set_up_cancel_signal() -> Arc<AtomicBool> {
 fn main() {
     let term = set_up_cancel_signal();
     let matches = cli().get_matches();
-    let total_iterations: u64 = match matches.subcommand() {
-        Some(("yield", sub_m)) => {
+    let is_sync = matches.get_one::<bool>("sync").unwrap_or(&false);
+    println!("sync: {}", is_sync);
+    let total_iterations: u64 = match (matches.subcommand(), is_sync) {
+        (Some(("socket", sub_m)), s) => {
+            let num_thread_pairs = sub_m.get_one::<u16>("THREAD_PAIRS").unwrap();
+            if *s {
+                csgb::run_socket(*num_thread_pairs, &term)
+            } else {
+                csgb::run_socket_async(*num_thread_pairs, term)
+            }
+        }
+        // other subcommands do not have an async implementation
+        (_, false) => std::unimplemented!("subcommand does not support async"),
+        (Some(("yield", sub_m)), true) => {
             let num_threads = sub_m.get_one::<u16>("THREADS").unwrap();
             csgb::run_yield(*num_threads, &term)
         }
-        Some(("sleep", sub_m)) => {
+        (Some(("sleep", sub_m)), true) => {
             let num_threads = sub_m.get_one::<u16>("THREADS").unwrap();
             let sleep_ns = sub_m.get_one::<u64>("SLEEP_NS").unwrap();
             csgb::run_sleep(*num_threads, sleep_ns, &term)
         }
-        Some(("futex", sub_m)) => {
+        (Some(("futex", sub_m)), true) => {
             let num_thread_pairs = sub_m.get_one::<u16>("THREAD_PAIRS").unwrap();
             csgb::run_futex(*num_thread_pairs, &term)
-        }
-        Some(("socket", sub_m)) => {
-            let num_thread_pairs = sub_m.get_one::<u16>("THREAD_PAIRS").unwrap();
-            csgb::run_socket(*num_thread_pairs, &term)
         }
         _ => {
             std::unreachable!("subcommand was required");

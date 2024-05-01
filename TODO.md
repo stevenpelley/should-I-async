@@ -19,33 +19,78 @@ Goals and todos:
 2. if necessary use PT to examine IPC over time to reproduce graph 1 and see if we observe a decrease in IPC around context switch or syscall boundaries.
 
 Might be fun to look at rust async for (1) but will be a huge time sync (lol).  Doing this in a true single-threaded manner requires that the executor be "bi-phasic" -- a phase for progressing futures and then a phase for polling io.  This differs from implementations I see where epoll is called from a separate dedicated thread which calls wake() for the corresponding futures or otherwise alerts the executor itself.
+tokio current thread executor does exactly this.  It will check for io/timer readiness when there are no futures to poll, or after a configurable number of future polls.  If io and timers are disabled then it will never call this, which is appropriate if futures themselves awaken other futures and make them pollable.
 
-async:
-smol looks a bit too complicated, and tokio moreso.  In particular I care that everything will run on the main thread (or the thread delegated to within a future), and that additional instructions are minimized.  Obviously I'd also like it to be simple but I'd trade off for something that is already complete and tested.
-basic architecture:
-
+design
 - sync: each outmost future/task will be in its own thread.  Socket/pipe "read" performs the context switch.  It will likely occur inside a different future for compatibility with async, in which case it calls a blocking read() and always returns complete.
-- async: a "read" is a Future that wakes when the corresponding "write" occurs, or returns as complete if it previously occurred.  It then performs the read with NOWAIT and asserts that it received its data.  This means a write must wake the reading future.  There must be an object associated with each end of each socket where the waiting read and waking write can interact.  This object can hold a flag "is async" to determine whether or not to use this wait/wake as well as to determine the syscall flags (NOWAIT).
+- async: a socket read or futex wait will be guarded by an async "sync" object such as notify that awaits some other future's corresponding write or wake call.  This guarantees that the read/wait will not block.  It can then perform the read with NOWAIT and asserts that it received its data.  This object can hold a flag "is async" to determine whether or not to use this wait/wake as well as to determine the syscall flags (NOWAIT); I'd like these to be static to reduce overhead and hopefully make it simpler.
 
-Executor: our executor assumes no external waking.  Every future either returns complete or is awoken by the polling of some other future.  So this can simply be a circular queue with a sufficient number of entries that is initialized with the root futures.  Execution is complete with the queue is empty.  There is no need (other than debugging) to track pending futures since there must be some other pollable future that will awaken them.  What is the required size of the queue?  Is it enough to track the root futures or do we need to also store the intermediate futures for an async read?  I _think_ it's enough for the root futures as the async read futures get embedded within these.
+Executor: just use tokio current thread executor without enabling io and timer.  This might be slightly heavier than is strictly required but it'll be easier as it handles future state, calling poll, and provides the sync primitives to coordinate.
 
-steps:
+built!
+result: with debug build they have comperable performance.  This makes sense since without context switches there is much more to do in userspace (a surprising amount for a tokio schedule).  With release build async is about 2.5x faster than context switch, which again makes sense.
+profiling is stymied by the rust standard library not have frame pointer (should be changed in 1.79 -- https://github.com/rust-lang/rust/pull/122646) and then need to use frame pointer in the build using -C force-frame-pointers=yes.
+--call-graph lbr does pretty well but can't correlate kernel calls.  It at least gets the relative weighting.
+Upwards of 75% of time spent in run_async_task (75% of 88% so more like 85% until I can account for the other 12%).  Of this about 40% of time spent in each of read and write syscall, 20% in tokio.
 
-1. hello world async unit test.  Creates a future via async, runs it by polling it.
-2. simple queue-based executor unit test.  Submits a bunch of tasks, polls for each.
-3. test with futures that await another future.
-4. test with futures that await multiple futures.  How does this impact the queue?
-5. rewrite sync sockets
-6. create and test async socket
-7. write async socket version
-8. update main app arguments.
+Next:
+look into why lbr call graphs don't provide kernel symbols
+look a bit more precisely at #threads/tasks.
+try to create IPC over time (either sliding window or time buckets) graph using pt.
+look at linux schedulers and their impact on context switch scheduling overhead
+look at kernel mechanisms that flush caches on context switch
 
-what do the blocking ops look like?
-yield - intra-batch executor phase calls wake on all yielded futures.
-futex - executor tracks woken futexes and calls wake on their futures.
-fd - executor calls epoll between batches and calls wake on corresponding ready fds.
+new command to provide more accurate timing:
+sudo perf record --kcore -Se -C 0 -e intel_pt/cyc,noretcomp,mtc_period=9/ timeout 1 taskset -a -c 0 /home/spelley/should-I-async/rust/csgb/target/release/csgb socket 1
+-Se is a snapshot only at the end
+-C 0 is everything on cpu 0, and the taskset limits to the same core
+cyc -- issue cyc data with each packet
+noretcomp -- don't compress return packets.  Each return packet gets cyc data
+mtc-period=9 -- coarse-grained mtc since we are using cyc.
 
-But the above adds epoll calls, which I want to avoid for a true comparison -- we _know_ which fds are ready because of the pipe/socket writes.  So in that case each future is explicitly marking which other future is ready so that it or the executor may call wake() on it for the next batch.
+still looking at call/ret trace with
+sudo perf script --call-ret-trace -C 0
+
+tokio notify and schedule is really expensive -- ~4us for task cycle.  Read and write syscalls each ~1us.  So user code still ~50% of time.  Perf stat suggested it's even more so this could also be some pt overhead?  Performance is really quite similar so I don't think so.  Perf stat says ~68% in user mode so this could just be accounting at the boundary.
+
+I want to get a flame graph from a perf run.  "perf report -g" fails with weird errors.  "perf report -g --stdio" works but is missing some top level tokio calls and only accounts for up to 68%.  Even running with a full record (not -Se) which generates 800mb of trace doesn't include the top levels.
+I believe the problem is that perf report only synthesizes call graphs up to 16 deep.  This can be increased with:
+sudo perf report -g --stdio --itrace=ig1024xe
+where --itrace=igxe is the default set of itrace options for perf report with intel-pt.  g1024 increases to the max of 1024 stack depth (overkill)
+now the coverage increases to ~90%!
+
+grr, all that I and was using a debug build
+
+release build:
+37.5% of time in user
+It looks like ~10% of time is in tokio notify/wake/schedule.
+I suspect that syscall_return_via_sysret is accounted as user mode?
+
+Now onto an IPC trace.
+sudo perf script --call-ret-trace -C 0 -F+ipc
+gives ipc but only at call and ret boundaries, calculated since the last report.  This is quite uneven in turn of number of cycles in each sample (as low as 3, as high as 226 at a quick glance).  I need this to be more consistent.
+sudo perf script -C 0 --itrace=i100us --ns
+gives a trace of instruction count synthesized per time period, instruction count, or tick.
+Problems:
+if synchesized per time it consistently under-estimates time.  Even at 100us, which is much much larger than the clock granularity, it gives samples around every 60us.
+Time is always in ns, not in cycles.  I want cycles and can't figure out how to get perf script to report it.  There's no option and I see no -F field.  The cycles field is quite coarse grained.
+way forward: use i100i or some other instruction count.  Use time as a direct proxy for cycles.  Look at power events to see changes in frequency:
+sudo perf script -C 0 --itrace=i100ip --ns
+Separately, use the call/return trace to identify a time period of interest and the interesting times within (syscalls, syscall returns, context switch)
+Anything more specific and complex will require building perf from scratch to get all of the perf script capabilities and scripts.
+
+But let's do it!
+Need a new container environment for building perf.  Can either do this in the devcontainer or create a new one.  Probably create a new one.
+Checkout linux source for current kernel.  See uname -r, but then likely need to strip the end.
+Get the current kernel config.  Can get from parent in /boot, might be able to get from /proc.
+
+
+Random notes on futures, dropping, and cancellation.
+I've been a bit confused regarding cancellation of futures.  It's frequently repeated in rust literature that a future is cancelled by dropping it.  A dropped future cannot be polled and thus it cannot make progress.  My confusion is this: while a dropped future cannot be polled, there is still some ongoing work and event the future is awaiting; does dropping the future cancel this work or does the work continue?  This work may consume some sort of resource (file descriptor; remote resource like a distributed lease) and so it's important to at least document what dropping the future does and does not release.
+The answer so far as I can tell is "it depends."  For example, in tokio with a unix epoll reactor creating a dropping a future does nothing regarding the underlying file descriptor and syscall; those resources are managed by the TcpStream.  As soon as the TcpStream is created it is registered with the reactor and epolled for "readiness events" (readable and writeable).  The future simply polls for this event and then performs the associated non-blocking syscall to read or write.  To cancel any associated syscalls the PollEvented<TcpStream> is dropped, which calls TcpStream (or io source)::deregister.
+
+My take: I'm sure this works well but it results in a confusing story regarding whether the "work" and "resources" are associated with the future or some other object.  Compare this to golang, where with tcp (which does not accept a context to cancel) it is clear that in order to cancel an operation you must either set the timeout to 0 or else close the stream.  It's clear that the work is associated with the stream, not with the action/method.  I'd like to see some similar delineation in rust.
+My instinct is that it's a good idea to associate resources with an _object_ and not the future.  The future represents an event and value only.
 
 -------
 
@@ -158,8 +203,58 @@ figure out how I'm going to split work in and out of container.  Perf is much ea
 
 
 
+### Building and running custom perf
 
+would like to stick this in a container.  Challenge is that git checkout for linux kernel is slow.  Can/should I mount a git repos?
 
+```
+  [ from ~/kernel]
+  795  2024-04-27 18:03:32 git clone git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
+  799  2024-04-29 12:35:24 cd kernel/
+  800  2024-04-29 12:35:27 cd linux-stable/
+  806  2024-04-29 12:37:44 git tag -l
+  807  2024-04-29 12:37:48 git checkout v6.8
+  808  2024-04-29 12:38:29 sudo apt-get install build-essential flex bison
+  809  2024-04-29 12:38:49 sudo apt-get install libelf-dev libnewt-dev libdw-dev libaudit-dev libiberty-dev libunwind-dev libcap-dev libzstd-dev libnuma-dev libssl-dev python3-dev python3-setuptools binutils-dev gcc-multilib liblzma-dev
+  811  2024-04-29 12:40:26 sudo apt install systemtap-sdt-dev
+  812  2024-04-29 12:40:37 sudo apt install clang
+  813  2024-04-29 12:40:59 sudo apt install libperl-dev
+  814  2024-04-29 12:41:26 sudo apt install libbabeltrace-ctf-dev
+  815  2024-04-29 12:42:09 sudo apt install libpfm4-dev
+  818  2024-04-29 12:45:43 sudo apt install libtraceevent-dev
+  824  2024-04-29 12:57:21 sudo apt install pkgconf
+  826  2024-04-29 12:57:38 PYTHON=python3 make -C tools/perf
+  829  2024-04-29 13:22:26 cd ~/perf_playground/
+  830  2024-04-29 13:23:01 sudo /home/spelley/kernel/linux-stable/tools/perf/perf record --kcore -Se -C 0 -e intel_pt/cyc,noretcomp,mtc_period=9/ timeout 1 taskset -a -c 0 /home/spelley/should-I-async/rust/csgb/target/release/csgb socket 1
+  831  2024-04-29 13:24:38 sudo /home/spelley/kernel/linux-stable/tools/perf/perf script -C 0 --itrace=i100ip --ns
+  833  2024-04-29 13:25:55 sudo apt-get install sqlite3 python3-pyside2.qtsql libqt5sql5-sqlite
+  834  2024-04-29 13:26:50 sudo apt-get install python3-pyside2.qtcore python3-pyside2.qtgui python3-pyside2.qtsql python3-pyside2.qtwidgets
+  839  2024-04-29 13:31:44 sudo /home/spelley/kernel/linux-stable/tools/perf/perf script --itrace=bep -s /home/spelley/kernel/linux-stable/tools/perf/scripts/python/export-to-sqlite.py ls-example.db branches calls
+```
+Note that there is a typo in `https://perf.wiki.kernel.org/index.php/Perf_tools_support_for_Intel%C2%AE_Processor_Trace#Downloading_and_building_the_latest_perf_tools` where it should install `libqt5sql5-sqlite` instead of `libqt5sql5-psql`
+
+### Interpretting sqlite data
+samples_view is the main set of events.  I generally see psb (samples delination for indexing), cbr (power events, see cbr_view for cpu frequency updates), and branches, which are the events we're truly interested in.  For each sample we get thinks like command, cpu, pid, tid, time in ns; and then location and branch information like instruction pointer, symbol, dso, and branch destination of these things.  If the record is the first for a new timestamp it also includes #cycles and #instructions since the last timestamp update.  Finally, we get flags -- see man perf-intel-pt for flags.
+
+flags:
+```
+The flags are "bcrosyiABExghDt" which stand for branch, call,
+       return, conditional, system, asynchronous, interrupt, transaction
+       abort, trace begin, trace end, in transaction, VM-entry, VM-exit,
+       interrupt disabled, and interrupt disable toggle respectively.
+```
+so all 'branches' samples should have 1.
+call has 2
+return has 4.
+
+for understanding function calls:
+calls_view -- the set of function calls and returns with call_id and return_id joining to samples id.
+call_paths_view -- joins to calls_view on id.  Represents stacks via self join on parent_id.
+
+getting the samples with a cycle/instruction count.  Some of these appear to not have a new timestamp because the sample's timestamp is the same as the previous sample with ns precision:
+```
+select id, time, insn_count, cyc_count, ipc from samples_view where insn_count > 0 or cyc_count > 0 order by id limit 100;
+```
 
 ### Accessing perf from inside a container
 The perf utility is tied to the specific kernel.  For debian and ubuntu, /usr/bin/perf is a shell script that searches in a number of predetermined locations, e.g., /usr/bin/perf-\`uname -r\` or /usr/lib/linux-tools/\`uname -r\`.  Additionally, perf inherently requires elevated privileges to access the PMU device, perf syscalls, and to expose system-wide and kernel data.  Here are some of the challenges I've faced:

@@ -1,17 +1,23 @@
 pub use imp::run_futex;
 pub use imp::run_sleep;
 pub use imp::run_socket;
+pub use imp::run_socket_async;
 pub use imp::run_yield;
 
 mod exec;
 
 mod imp {
+    use async_trait::async_trait;
     use core::panic;
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
+    use tokio;
 
     // A runner provides methods (and state) to run one iteration and to gracefully
     // cancel/terminate execution.
@@ -254,6 +260,135 @@ mod imp {
         });
     }
 
+    fn create_async_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("creating runtime")
+    }
+
+    #[async_trait]
+    trait AsyncRunner {
+        async fn one_iteration(&mut self);
+        async fn on_cancelled(&mut self);
+    }
+
+    // runner is a mutex simply to be able to Send it
+    async fn run_task_async(term: Arc<AtomicBool>, mut runner: Box<dyn AsyncRunner>) -> u64 {
+        let mut count: u64 = 0;
+        loop {
+            {
+                if term.load(Ordering::Relaxed) {
+                    runner.on_cancelled().await;
+                    break;
+                }
+
+                runner.one_iteration().await;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn run_async(term: Arc<AtomicBool>, runners: Vec<Box<dyn AsyncRunner>>) -> u64 {
+        // tasks are spawned into a local set (so tasks need not be Send), and
+        // into a join set so more easily await them.
+        let local_set = tokio::task::LocalSet::new();
+        let mut join_set: tokio::task::JoinSet<u64> = tokio::task::JoinSet::new();
+        for runner in runners {
+            let term_arc = term.clone();
+            join_set.spawn_local_on(run_task_async(term_arc, runner), &local_set);
+        }
+
+        let runtime = create_async_runtime();
+        local_set.block_on(&runtime, async move {
+            let mut result: Result<u64, tokio::task::JoinError> = Ok(0);
+            while let Some(joined) = join_set.join_next().await {
+                match (&result, joined) {
+                    // already have an error
+                    (Err(_), _) => continue,
+                    (Ok(_), Err(e)) => result = Err(e),
+                    (Ok(c1), Ok(c2)) => result = Ok(c1 + c2),
+                };
+            }
+            result.expect("join error")
+        })
+    }
+
+    struct AsyncSocket1 {
+        stream: UnixStream,
+        buf: [u8; 1],
+        notify1: Arc<tokio::sync::Notify>,
+        notify2: Arc<tokio::sync::Notify>,
+        cancel_barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl AsyncRunner for AsyncSocket1 {
+        async fn one_iteration(&mut self) {
+            self.stream.write(&self.buf).expect("writing socket");
+            self.notify2.notify_one();
+
+            self.notify1.notified().await;
+            self.stream.read(&mut self.buf).expect("reading socket");
+        }
+        async fn on_cancelled(&mut self) {
+            // discard any error
+            let _ = self.stream.write(&self.buf);
+            self.notify2.notify_one();
+            self.cancel_barrier.wait().await;
+        }
+    }
+
+    struct AsyncSocket2 {
+        stream: UnixStream,
+        buf: [u8; 1],
+        notify1: Arc<tokio::sync::Notify>,
+        notify2: Arc<tokio::sync::Notify>,
+        cancel_barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl AsyncRunner for AsyncSocket2 {
+        async fn one_iteration(&mut self) {
+            self.notify2.notified().await;
+            self.stream.read(&mut self.buf).expect("reading socket");
+
+            self.stream.write(&self.buf).expect("writing socket");
+            self.notify1.notify_one();
+        }
+        async fn on_cancelled(&mut self) {
+            // discard any error
+            let _ = self.stream.write(&self.buf);
+            self.notify1.notify_one();
+            self.cancel_barrier.wait().await;
+        }
+    }
+
+    pub fn run_socket_async(num_pairs: u16, term: std::sync::Arc<AtomicBool>) -> u64 {
+        let mut runners: Vec<Box<dyn AsyncRunner>> = Vec::with_capacity((num_pairs as usize) * 2);
+        for _ in 0..num_pairs {
+            let n1 = Arc::new(tokio::sync::Notify::new());
+            let n2 = Arc::new(tokio::sync::Notify::new());
+            let b = Arc::new(tokio::sync::Barrier::new(2));
+            let pair = UnixStream::pair().expect("creating unix socket pair");
+            runners.push(Box::new(AsyncSocket1 {
+                stream: pair.0,
+                buf: [0],
+                notify1: n1.clone(),
+                notify2: n2.clone(),
+                cancel_barrier: b.clone(),
+            }));
+            runners.push(Box::new(AsyncSocket2 {
+                stream: pair.1,
+                buf: [0],
+                notify1: n1.clone(),
+                notify2: n2.clone(),
+                cancel_barrier: b.clone(),
+            }));
+        }
+        run_async(term, runners)
+    }
+
     #[cfg(test)]
     mod tests {
         use std::{
@@ -261,6 +396,8 @@ mod imp {
             sync::{atomic::AtomicBool, Arc},
             time::Duration,
         };
+
+        use crate::imp::run_socket_async;
 
         use super::run_futex;
 
@@ -278,6 +415,13 @@ mod imp {
         fn test_futex() {
             let term = term_after(Duration::from_secs(1));
             let num_echoes = run_futex(100, &term);
+            assert!(num_echoes > 0);
+        }
+
+        #[test]
+        fn test_socket_async() {
+            let term = term_after(Duration::from_secs(1));
+            let num_echoes = run_socket_async(100, term);
             assert!(num_echoes > 0);
         }
     }

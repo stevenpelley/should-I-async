@@ -1,3 +1,5 @@
+/// testing ground for async executor stuff.
+/// no implementation here
 mod exec {
     #[cfg(test)]
     mod hello_world_poll_test {
@@ -180,6 +182,39 @@ mod exec {
 
             let poll = f.as_mut().poll(&mut ctx);
             assert_eq!(std::task::Poll::Ready(0), poll);
+        }
+    }
+
+    #[cfg(test)]
+    mod tokio_test {
+        use tokio::runtime;
+
+        #[test]
+        fn test_tokio() -> std::result::Result<(), Box<dyn std::error::Error>> {
+            let rt = runtime::Builder::new_current_thread().build()?;
+            let n1 = tokio::sync::Notify::new();
+            let n2 = tokio::sync::Notify::new();
+            let (r1, r2) = rt.block_on(async {
+                tokio::join!(
+                    async {
+                        for _ in 0..5 {
+                            n2.notify_one();
+                            n1.notified().await;
+                        }
+                        0
+                    },
+                    async {
+                        for _ in 0..5 {
+                            n2.notified().await;
+                            n1.notify_one();
+                        }
+                        1
+                    }
+                )
+            });
+            assert_eq!(0, r1);
+            assert_eq!(1, r2);
+            return std::result::Result::Ok(());
         }
     }
 }
