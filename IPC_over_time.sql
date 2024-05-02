@@ -1,6 +1,8 @@
 -- SQLite
 with timestamped_samples as (
     select
+    -- only care about the samples where we have a cycle or instruction count,
+    -- which will also provide new timestamps
         id,
         time,
         insn_count,
@@ -9,15 +11,19 @@ with timestamped_samples as (
     where insn_count > 0 or cyc_count > 0
 ), timestamped2 as (
     select
+    -- calculate cumulative instructions and cycles.  Cumulative cycles acts as
+    -- a more precise timestamp.  Cumulative instrucitons are needed to
+    -- calculate sum of instructions across many samples.
         *,
         time - (select min(time) from timestamped_samples) as offset_time,
         sum(insn_count) over (order by id range unbounded preceding) as cumulative_insn_count,
         sum(cyc_count) over (order by id range unbounded preceding) as cumulative_cyc_count
     from timestamped_samples
 ), time_ranges as (
+    select
+    -- turn adjacent samples into time ranges.
     -- end time/cycles of a time_range belongs to the range
     -- start time/cycles of a time_range belongs to the previous range
-    select
         lag(id) over (order by id) as start_sample_id,
         lag(offset_time) over (order by id) as start_time,
         lag(cumulative_insn_count) over (order by id) as start_cum_insns,
@@ -31,11 +37,20 @@ with timestamped_samples as (
     from timestamped2
 ), buckets as (
     select
+    -- define the buckets for our plot.  We'll use the time ranges to assign
+    -- instructions and cycles to buckets.
+    --
+    -- note that this can be turned into more of a rolling window by using
+    -- bucket_cycles that is larger than the "step".  Buckets will then overlap
         gs.value as bucket_start_cyc, 
-        gs.value + 250 as bucket_end_cyc
+        gs.value + 250 as bucket_end_cyc,
+        250 as bucket_cycles
     from generate_series(0, 2000, 250) as gs
 ), joined_buckets_to_ranges as (
     select
+    -- locate the start and end time ranges of each bucket.
+    -- we filter out buckets whose start or end range contains any null, which
+    -- can happen for buckets that begin or end before or after all the samples.
         b.*,
         t1.start_sample_id as start_bucket_start_sample_id,
         t1.start_time      as start_bucket_start_time,
@@ -56,32 +71,89 @@ with timestamped_samples as (
         t2.end_cum_insns   as end_bucket_end_cum_insns,
         t2.end_cum_cyc     as end_bucket_end_cum_cyc,
         t2.insn_count      as end_bucket_insn_count,
-        t2.cyc_count       as end_bucket_cyc_count
-    from buckets as b left outer join time_ranges as t1 left outer join time_ranges as t2
-    where
-        b.bucket_start_cyc between (t1.start_cum_cyc + 1) and t1.end_cum_cyc
-        and
-        b.bucket_end_cyc between (t2.start_cum_cyc + 1) and t2.end_cum_cyc
+        t2.cyc_count       as end_bucket_cyc_count,
+        t1.end_sample_id = t2.end_sample_id as is_start_end_same
+    from
+        buckets as b left outer join time_ranges as t1
+        ON b.bucket_start_cyc between (t1.start_cum_cyc + 1) and t1.end_cum_cyc
+        left outer join time_ranges as t2
+        ON b.bucket_end_cyc between (t2.start_cum_cyc + 1) and t2.end_cum_cyc
+    -- don't want to deal with buckets without an end point.
+    WHERE
+        start_bucket_start_sample_id is not null and
+        start_bucket_end_sample_id is not null and
+        end_bucket_start_sample_id is not null and
+        end_bucket_end_sample_id is not null
+), buckets_ranges_insns as (
+    select
+    -- calculate the number of instructions and cycles in the bucket for the following 3 cases:
+    --   cycles = bucket size
+    --   insns = start range insns +
+    --           "interior" (entirely within bucket) insns +
+    --           end range insns
+    --           - double count if start range is end range
+    --   start range is end range: start_bucket_start_sample_id = end_bucket_start_sample_id
+    --   interior insns = iff(
+    --           startt range is end range,
+    --           0,
+    --           end_bucket_start_cum_insns - start_bucket_end_cum_insns)
+    --
+    -- linear interpolation: assume instructions retire evenly throughout each time range.
+    -- this produces an IPC per bucket that would combine to produce an accurate
+    -- IPC at coarser time scales.  In other words, each instruction is accounted for once.
+    --   start range insns = insns * (range end cyc - bucket start cyc) / (range end cyc - range start cyc)
+    --   end range insns = insns * (bucket end cyc - range start cyc) / (range end cyc - range start cyc)
+    --   double count: start range insns
+    --
+    -- "conservative" assume all instructions in the boundary time ranges retire outside
+    -- each bucket.  This results in the lowest possible IPC, but would under-estimate IPC
+    -- when considered across buckets.  Instructions in boundary time ranges are not accounted
+    -- for in any bucket.
+    --   start range insns = 0
+    --   end range insns = 0
+    --   double count: 0
+    -- 
+    -- "optimistic" assume all instructions in the boundary time ranges retire inside
+    -- each bucket.  This results in the highest possible IPC, but over-estimates IPC
+    -- when considered across buckets.  Instructions in boundary time ranges are double counted.
+    --   start range insns = insns
+    --   end range insns = insns
+    --   double count: start range insns
+        *,
+        iif(
+            is_start_end_same,
+            0,
+            end_bucket_start_cum_insns - start_bucket_end_cum_insns
+        ) as interior_insns,
+        iif(is_start_end_same, start_bucket_insn_count, 0) as linear_and_conservative_double_count,
+        start_bucket_insn_count * (start_bucket_end_cum_cyc - bucket_start_cyc) / cast(start_bucket_cyc_count as REAL) as linear_interp_start_insns,
+        end_bucket_insn_count * (bucket_end_cyc - end_bucket_start_cum_cyc) / cast(end_bucket_cyc_count as REAL) as linear_interp_end_insns
+    from joined_buckets_to_ranges
+), buckets_insns as (
+    select
+    -- calculate instruction count for the bucket for the 3 strategies.
+        *,
+        linear_interp_start_insns + interior_insns + linear_interp_end_insns - linear_and_conservative_double_count as linear_interp_insns,
+        interior_insns as conservative_insns,
+        start_bucket_insn_count + interior_insns + end_bucket_insn_count - linear_and_conservative_double_count as optimistic_insns
+    from buckets_ranges_insns
+), buckets_ipc as (
+    select
+    -- calculate ipc for the 3 strategies
+        *,
+        cast(linear_interp_insns as real) / bucket_cycles as linear_interp_ipc,
+        cast(conservative_insns as real) / bucket_cycles as conservative_ipc,
+        cast(optimistic_insns as real) / bucket_cycles as optimistic_ipc
+    from buckets_insns
 )
-select * from joined_buckets_to_ranges order by bucket_start_cyc
---select 1
---select min(time) from samples_view where command='csgb'
---select * from timestamped2 where time > 259034356306612 order by id limit 1
+select * from buckets_ipc order by bucket_start_cyc
 ;
-
---select * from samples_view where id in (95, 98);
---select * from samples_view order by cyc_count desc limit 100;
-
---select * from comm_threads_view where pid = 194955 order by command, pid, thread_id;
---select * from context_switches_view where cpu=0 order by time;
 
 -- pid 194955 swaps out as csgb at 259033364173326 whereas prior to that it swaps as taskset
 -- clearly it execs, the samples table/view may only join it as the last command name
 -- confirmed: timeout, taskset, and csgb are all pid 194955
 --
 -- conclusion: don't trust comm in samples/samples_view.
-
-
 
 -- task:
 -- collect all samples belonging to a timestamp together so that we can order by the longest blocks and look for common branches (e.g., syscall return)

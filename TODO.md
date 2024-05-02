@@ -2,32 +2,40 @@
 
 This file acts as a rough list and description of tasks to be done or ideas under discussion
 
-## Next Steps
+## Overall Vision
 
 Goals and todos:
 
-1. compare comparable blocking vs async implementations of yield, futex, pipe, socket.  Vary # threads/pairs, some synthetic access with size and stride on each iteration, and cpu affinity.  The goal is to keep system calls as similar as possible -- yield async has none and task reschedules itself, futex schedules corresponding task as runnable, pipe and socket add to an epoll loop that schedule corresponding ready files as runnable.  Scheduling is done on a batch basis -- run all runnable tasks, which may schedule additional tasks to the _next_ batch; when done with all tasks in batch run any intra-batch runtime code (e.g., epoll)
+1. compare comparable blocking vs async implementations of socket echo.  Vary # threads/pairs, some synthetic access with size and stride on each iteration, and cpu affinity.  The goal is to keep system calls as similar as possible -- the async implementation performs no epoll, performs a read only when the corresponding write has already occurred, and we verify after the fact that no blocking/context switches are occuring.
 
     i. compare performance
 
-    ii. compare IPC -- if IPC is similar then the overhead is direct.  Can a ~50-100ns per iteration kernel mode switching cost account for difference in IPC?
+    ii. compare IPC -- similar IPC supports direct overhead.
 
     iii. examine cache and TLB miss rates.
 
     iv. look at simple perf stack sampling and see if the overhead attributed to schedule() in kernel accounts for performance difference.
 
-2. if necessary use PT to examine IPC over time to reproduce graph 1 and see if we observe a decrease in IPC around context switch or syscall boundaries.
+2. Use PT to examine IPC over time to reproduce graph 1 and see if we observe a decrease in IPC around context switch or syscall boundaries.
 
-Might be fun to look at rust async for (1) but will be a huge time sync (lol).  Doing this in a true single-threaded manner requires that the executor be "bi-phasic" -- a phase for progressing futures and then a phase for polling io.  This differs from implementations I see where epoll is called from a separate dedicated thread which calls wake() for the corresponding futures or otherwise alerts the executor itself.
-tokio current thread executor does exactly this.  It will check for io/timer readiness when there are no futures to poll, or after a configurable number of future polls.  If io and timers are disabled then it will never call this, which is appropriate if futures themselves awaken other futures and make them pollable.
+## Current task
 
-design
-- sync: each outmost future/task will be in its own thread.  Socket/pipe "read" performs the context switch.  It will likely occur inside a different future for compatibility with async, in which case it calls a blocking read() and always returns complete.
-- async: a socket read or futex wait will be guarded by an async "sync" object such as notify that awaits some other future's corresponding write or wake call.  This guarantees that the read/wait will not block.  It can then perform the read with NOWAIT and asserts that it received its data.  This object can hold a flag "is async" to determine whether or not to use this wait/wake as well as to determine the syscall flags (NOWAIT); I'd like these to be static to reduce overhead and hopefully make it simpler.
+I have a skeleton workflow for profling with pt and producing ipc of time buckets along with error bound.
 
-Executor: just use tokio current thread executor without enabling io and timer.  This might be slightly heavier than is strictly required but it'll be easier as it handles future state, calling poll, and provides the sync primitives to coordinate.
+1. come up with a query and plot to aid with identifying the time range of interest.
+1. plot ipc.  I want 3 lines indicating linear interpolation, conservative, and optimistic (these are the error bound)
+1. turn off frequency scaling.
+1. change the ipc plot to take configurable time range, bucket size, and bucket step (allowing for overlapping buckets/rolling window)
+1. can I combine the plot to identify interesting time ranges with ipc in an interactive plot that allows me to zoom in and slide?
+1. add events/event ranges to the ipc plot: usermode vs kernel; cbr and psb packets; any timed packet (to interpret error bounds); syscall enter/exit; context switch; important functions like __schedule()
 
-built!
+# Work Log
+
+async implementation: tokio provides everything we need.
+a current thread executor will be entirely single threaded.  IO and timer polling is interleaved with future polling if necessary.  In our case we do not include IO and timer feature flags and do not enable them, so these facilities will never be polled.
+We can also use a local set to constrain sets of tasks to the same thread and avoid "Send" futures.
+Use async notify pairs alongside the socket endpoints to notify the read side of a socket pair after writing to the socket.  This yields a future at read if the socket hasn't been written and resumes the read future when it is written.
+
 result: with debug build they have comperable performance.  This makes sense since without context switches there is much more to do in userspace (a surprising amount for a tokio schedule).  With release build async is about 2.5x faster than context switch, which again makes sense.
 profiling is stymied by the rust standard library not have frame pointer (should be changed in 1.79 -- https://github.com/rust-lang/rust/pull/122646) and then need to use frame pointer in the build using -C force-frame-pointers=yes.
 --call-graph lbr does pretty well but can't correlate kernel calls.  It at least gets the relative weighting.
@@ -85,15 +93,14 @@ Checkout linux source for current kernel.  See uname -r, but then likely need to
 Get the current kernel config.  Can get from parent in /boot, might be able to get from /proc.
 
 
-Random notes on futures, dropping, and cancellation.
+#### Random notes on futures, dropping, and cancellation.
 I've been a bit confused regarding cancellation of futures.  It's frequently repeated in rust literature that a future is cancelled by dropping it.  A dropped future cannot be polled and thus it cannot make progress.  My confusion is this: while a dropped future cannot be polled, there is still some ongoing work and event the future is awaiting; does dropping the future cancel this work or does the work continue?  This work may consume some sort of resource (file descriptor; remote resource like a distributed lease) and so it's important to at least document what dropping the future does and does not release.
 The answer so far as I can tell is "it depends."  For example, in tokio with a unix epoll reactor creating a dropping a future does nothing regarding the underlying file descriptor and syscall; those resources are managed by the TcpStream.  As soon as the TcpStream is created it is registered with the reactor and epolled for "readiness events" (readable and writeable).  The future simply polls for this event and then performs the associated non-blocking syscall to read or write.  To cancel any associated syscalls the PollEvented<TcpStream> is dropped, which calls TcpStream (or io source)::deregister.
 
 My take: I'm sure this works well but it results in a confusing story regarding whether the "work" and "resources" are associated with the future or some other object.  Compare this to golang, where with tcp (which does not accept a context to cancel) it is clear that in order to cancel an operation you must either set the timeout to 0 or else close the stream.  It's clear that the work is associated with the stream, not with the action/method.  I'd like to see some similar delineation in rust.
 My instinct is that it's a good idea to associate resources with an _object_ and not the future.  The future represents an event and value only.
 
--------
-
+#### pt vs lbr and profiling performance
 intel pt sees roughly 2x overhead on context switches due to recording pid, tid, cpu, etc on context switches.  But LBR amazingly seems much much worse performance, even with a low sampling frequency.
 
 intel pt:
@@ -141,6 +148,7 @@ do_syscall_64 : __x64_sys_sched_yield : do_sched_yield : schedule : __schedule :
 Answer: it looks like the kernel records information for perf on every context switch if "perf_sched_events": cpu, pid, tid, time, etc.  Unclear if this is used to later fill in the instruction trace or if it is incidental.  It essentially doubles the cost of a context switch
 
 
+#### resources while investigating profiled performance
 
 helpful link on tracing __switch_to, which switches tasks in kernel: https://perf.wiki.kernel.org/index.php/Perf_tools_support_for_Intel%C2%AE_Processor_Trace#Example:_Tracing_switch_to.28.29
 also __schedule: https://perf.wiki.kernel.org/index.php/Perf_tools_support_for_Intel%C2%AE_Processor_Trace#Example:_Tracing_schedule.28.29
@@ -155,6 +163,7 @@ I think the performance issue might be one of the following:
 
 perf record -a ... shows a slight improvement as it no longer needs to check on a context switch if it should continue recording.
 
+#### research on context switch and thread scheduling overhead
 
 https://www.youtube.com/watch?v=KXuZi9aeGTw
 google talk acknowledging that the modern cost of a context switch is the direct cost (running instructions, not impact on IPC) of the scheduler.  They discuss the google-internal implementation of futex_swap.  The "delegate" story is interesting and I don't understand completely -- detecting and responding to unexpected blocking.
@@ -174,7 +183,7 @@ https://lore.kernel.org/lkml/20210603195924.361327-1-andrealmeid@collabora.com/
 conclusion of all this:
 if context switch overhead is direct overhead in kernel scheduling we aught to observe this from simple system profiling and flamegraph analysis.  Still useful to reproduce the IPC-time series graph and prove this.  "Proving" still requires compareing a thread-blocking implementation against a user-mode scheduler implementation.
 
-OLD
+#### Notes on running perf in containers
 
 bind mount host perf executable for the container.  On ubuntu host this is in /usr/lib/linux-tools/... and the `which perf` binary locates and execs that one.  Need to bind mount the real one, not the wrapper, and this might be different for everyone.  Hard to make it portable.
 change container to --privileged
@@ -200,7 +209,6 @@ Need to parse the above.  Looking specifically for:
 need to change the sampling frequency (recommended 97 times a second to remove aliasing effects with things that are every ms or every 10ms)
 
 figure out how I'm going to split work in and out of container.  Perf is much easier to do outside of container but I need to be able to automate and repeat things.
-
 
 
 ### Building and running custom perf
@@ -275,6 +283,8 @@ conclusion:
 
 ### Perf Misc
 `/proc/sys/kernel/perf_event_paranoid` set to -1 or figure out CAP for perf
+
+# Really really old and outdated plan
 
 ### Test Harness and Profile Tooling
 Docker test harness
