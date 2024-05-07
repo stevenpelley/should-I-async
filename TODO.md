@@ -22,12 +22,11 @@ Goals and todos:
 
 I have a skeleton workflow for profling with pt and producing ipc of time buckets along with error bound.
 
-1. come up with a query and plot to aid with identifying the time range of interest.
+1. turn off frequency scaling.  Repeat perf record
+1. use perf script callstack+ret to find an interesting time range (steady state; 1-3 iterations)
 1. plot ipc.  I want 3 lines indicating linear interpolation, conservative, and optimistic (these are the error bound)
-1. turn off frequency scaling.
 1. change the ipc plot to take configurable time range, bucket size, and bucket step (allowing for overlapping buckets/rolling window)
-1. can I combine the plot to identify interesting time ranges with ipc in an interactive plot that allows me to zoom in and slide?
-1. add events/event ranges to the ipc plot: usermode vs kernel; cbr and psb packets; any timed packet (to interpret error bounds); syscall enter/exit; context switch; important functions like __schedule()
+1. add events/event ranges to the ipc plot: usermode vs kernel; cbr and psb packets; any timed packet (to interpret error bounds); syscall enter/exit (with syscall function if possible); context switch; important functions like __schedule()
 
 # Work Log
 
@@ -237,7 +236,7 @@ would like to stick this in a container.  Challenge is that git checkout for lin
   831  2024-04-29 13:24:38 sudo /home/spelley/kernel/linux-stable/tools/perf/perf script -C 0 --itrace=i100ip --ns
   833  2024-04-29 13:25:55 sudo apt-get install sqlite3 python3-pyside2.qtsql libqt5sql5-sqlite
   834  2024-04-29 13:26:50 sudo apt-get install python3-pyside2.qtcore python3-pyside2.qtgui python3-pyside2.qtsql python3-pyside2.qtwidgets
-  839  2024-04-29 13:31:44 sudo /home/spelley/kernel/linux-stable/tools/perf/perf script --itrace=bep -s /home/spelley/kernel/linux-stable/tools/perf/scripts/python/export-to-sqlite.py ls-example.db branches calls
+  839  2024-04-29 13:31:44 sudo /home/spelley/kernel/linux-stable/tools/perf/perf script --itrace=bep -s /home/spelley/kernel/linux-stable/tools/perf/scripts/python/export-to-sqlite.py pt.db branches calls
 ```
 Note that there is a typo in `https://perf.wiki.kernel.org/index.php/Perf_tools_support_for_Intel%C2%AE_Processor_Trace#Downloading_and_building_the_latest_perf_tools` where it should install `libqt5sql5-sqlite` instead of `libqt5sql5-psql`
 
@@ -263,6 +262,51 @@ getting the samples with a cycle/instruction count.  Some of these appear to not
 ```
 select id, time, insn_count, cyc_count, ipc from samples_view where insn_count > 0 or cyc_count > 0 order by id limit 100;
 ```
+
+### disabling frequency scaling
+Frequency changes throughout the recording, evidenced by cbr packets (e.g., between cbr 28 and 29 for 2796 and 2895Mhz, respectively)
+
+Locate cbr packets in perf.data:
+```
+sudo /home/spelley/kernel/linux-stable/tools/perf/perf script --itrace=p | grep cbr
+```
+
+I've tried to disable with:
+```
+sudo cpupower set -b 0
+sudo cpupower frequency-set -g performance
+```
+But this is insufficient.  It stays near 2.8, but switches between two nearby frequencies.
+
+setting a specific frequency did not work:
+```
+sudo cpupower frequency-set -f 2.8GHz
+
+Setting cpu: 0
+Error setting new values. Common errors:
+- Do you have proper administration rights? (super-user?)
+- Is the governor you requested available and modprobed?
+- Trying to set an invalid policy?
+- Trying to set a specific frequency, but userspace governor is not available,
+   for example because of hardware which cannot be set to a specific frequency
+   or because the userspace governor isn't loaded?
+```
+
+https://unix.stackexchange.com/questions/153693/cant-use-userspace-cpufreq-governor-and-set-cpu-frequency
+suggests:
+```
+disable the current driver: add intel_pstate=disable to your kernel boot line
+boot, then load the userspace module: modprobe cpufreq_userspace
+set the governor: sudo cpupower frequency-set --governor userspace
+set the frequency: sudo cpupower --cpu all frequency-set --freq 2000MHz
+```
+
+kernel boot param instructions: https://wiki.ubuntu.com/Kernel/KernelBootParameters
+add option to /etc/default/grub GRUB_CMDLINE_LINUX_DEFAULT
+sudo update-grub
+
+This appears to have worked (see sudo cpupower -c all frequency-info) but the greatest settable frequency is 2.00 GHz.  The cbr packet says that the frequency is 1997MHz but there's only one so I'll take it.
+
 
 ### Accessing perf from inside a container
 The perf utility is tied to the specific kernel.  For debian and ubuntu, /usr/bin/perf is a shell script that searches in a number of predetermined locations, e.g., /usr/bin/perf-\`uname -r\` or /usr/lib/linux-tools/\`uname -r\`.  Additionally, perf inherently requires elevated privileges to access the PMU device, perf syscalls, and to expose system-wide and kernel data.  Here are some of the challenges I've faced:

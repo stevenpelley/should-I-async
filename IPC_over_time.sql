@@ -221,3 +221,9 @@ select * from buckets_ipc order by bucket_start_cyc
 ----from has_syscall_return
 ----where group_sample_id = id
 ----;
+
+
+--select * from samples_view where event not in ('branches', 'unknown', 'psb') order by id;
+select * from cbr;
+
+select * from samples_view limit 10;
