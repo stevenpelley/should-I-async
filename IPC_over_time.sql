@@ -1,4 +1,7 @@
--- SQLite
+-- define time buckets
+-- assign instructions to buckets using interpolation, conservative, and
+-- optimistic strategies; see comments below in query
+-- calculate IPC for each bucket and each strategy
 with timestamped_samples as (
     select
     -- only care about the samples where we have a cycle or instruction count,
@@ -146,84 +149,140 @@ with timestamped_samples as (
         cast(optimistic_insns as real) / bucket_cycles as optimistic_ipc
     from buckets_insns
 )
-select * from buckets_ipc order by bucket_start_cyc
+--select * from buckets_ipc order by bucket_start_cyc
+select 1
 ;
 
--- pid 194955 swaps out as csgb at 259033364173326 whereas prior to that it swaps as taskset
--- clearly it execs, the samples table/view may only join it as the last command name
--- confirmed: timeout, taskset, and csgb are all pid 194955
---
--- conclusion: don't trust comm in samples/samples_view.
 
--- task:
--- collect all samples belonging to a timestamp together so that we can order by the longest blocks and look for common branches (e.g., syscall return)
+-- examine errors by calculating gaps between errors and joining to the
+-- previous, matching, and next samples by time.
 --
--- the longest cyc blocks contain a cbr.  Possible that they contain cbr because
--- they are long, but also that they are long because of the cbr.  It's
--- reasonable to assume that a power event changing the core's frequency would
--- have a delay
---
--- many long blocks are associated with rare events -- file system, process
--- startup and exit, page faults, malloc syscalls, perf process, irq kernel functions
---
--- I think we'll have to add some more filters to examine because there's a lot
--- of "rare noise" that turns out isn't so rare
---
--- some syscall returns contain psb, which from man page is known to cause a timing bubble.
--- I also see syscall entry with high cyc count, but many have kmalloc or other (I assume) rare events and IPC ~0.15 which isn't a huuuuge stall
---
--- there are some curious long, slow blocks in tokio calls.
---
--- near the 1000 cyc mark I see a lot of syscall returns and they all contain a psb
--- do syscall returns categorically contain a psb?
--- how do I filter for groups that have a symbol 'syscall_return_via_sysret' or branch type 'return from system call'
--- with a self join on group_sample_id looking for that branch_type_name
---
--- answer: the most expensive syscall returns have a psb or cbr, but the vast
--- majority of syscall returns have neither and are still long.
---
--- let's get an average group cyc count for these groups.
--- average is 681 cycles.  Syscall returns, at least for socket read and write
--- and recorded here, are expensive.
-----with t1 as (
-----    select
-----        *,
-----        sum(cyc_count) over (order by id range unbounded preceding) as cum_cyc_count
-----    from samples_view
-----), t2 as (
-----    select 
-----    *,
-----    iif(cyc_count > 0, id, min(id) over (order by cum_cyc_count groups between current row and 1 following exclude group)) as group_sample_id,
-----    iif(cyc_count > 0, cyc_count, max(cyc_count) over (order by cum_cyc_count groups between current row and 1 following exclude group)) as group_cyc_count,
-----    iif(cyc_count > 0, insn_count, max(insn_count) over (order by cum_cyc_count groups between current row and 1 following exclude group)) as group_insn_count,
-----    iif(cyc_count > 0, IPC, max(IPC) over (order by cum_cyc_count groups between current row and 1 following exclude group)) as group_ipc
-----    from t1
-----), has_syscall_return as (
-----    select
-----        group_cyc_count,
-----        group_sample_id,
-----        group_insn_count,
-----        id,
-----        group_ipc,
-----        command,
-----        pid,
-----        event,
-----        branch_type_name,
-----        symbol,
-----        dso_short_name,
-----        to_symbol,
-----        to_dso_short_name
-----    from t2
-----    where exists (select 1 from t2 as t22 where t2.group_sample_id = t22.group_sample_id and t22.branch_type_name = 'return from system call')
-----)
-----select
-----    avg(group_cyc_count)
-----from has_syscall_return
-----where group_sample_id = id
-----;
+-- analysis: for my trace there is always a matching 'begin trace' sample.
+-- there might be multiple joined samples if multiple packets were sent with the same timestamp.
+with error_and_next as (
+    select
+        (select min(s.time) from samples_view as s where s.time > a.time) as next_sample_time,
+        (select s.time from samples_view as s where s.time = a.time) as matching_sample_time,
+        (select max(s.time) from samples_view as s where s.time < a.time) as prev_sample_time,
+        *
+    from auxtrace_errors_view as a
+), with_gaps as (
+    select
+        next_sample_time - error_and_next.time as next_gap_duration,
+        error_and_next.time - prev_sample_time as prev_gap_duration,
+        *
+    from error_and_next
+), timestamped_samples as (
+    select *
+    from samples_view
+    where insn_count > 0 or cyc_count > 0
+), error_samples as (
+    select
+        s1.id as next_sample_id,
+        s1.branch_type_name as next_branch_type,
+        s2.id as prev_sample_id,
+        s2.branch_type_name as prev_branch_type,
+        s3.id as matching_sample_id,
+        s3.branch_type_name as matching_branch_type,
+        t.*
+    from
+        with_gaps as t
+        left outer join timestamped_samples as s1 on next_sample_time = s1.time
+        left outer join timestamped_samples as s2 on prev_sample_time = s2.time
+        left outer join timestamped_samples as s3 on matching_sample_time = s3.time
+)
+--select * from error_samples order by id
+select 1
+;
 
+-- make sure that errors and 'trace begin' are 1:1
+-- it is 1:1 if this returns 0 rows
+-- full outer join not supported wtf.  Emulate with union all'ed left outer
+-- joins
+with my_samples as (
+    select * from samples_view where branch_type_name='trace begin'
+), e_left as (
+    select
+        e.time as err_time,
+        s.time as sample_time,
+        e.id as err_id,
+        s.id as sample_id
+    FROM
+        auxtrace_errors_view as e left outer join my_samples as s ON e.time = s.time
+), s_left as (
+    select
+        e.time as err_time,
+        s.time as sample_time,
+        e.id as err_id,
+        s.id as sample_id
+    FROM
+        my_samples as s left outer join auxtrace_errors_view as e ON e.time = s.time
+), full_outer as (
+    select * from e_left
+    UNION ALL
+    select * from s_left
+)
+select *
+FROM full_outer
+WHERE err_time is null OR sample_time is null
+order by err_time, sample_time
+;
 
---select * from samples_view where event not in ('branches', 'unknown', 'psb') order by id;
-select * from cbr;
-
-select * from samples_view limit 10;
+-- calculate durations from (start OR trace begin) to (last sample before next trace begin OR end)
+-- the above query proved that errors are 1:1 with 'trace begin' samples so we will use only 'trace begin'
+-- note that we don't bother calculating the last end of the last range since the trial would have been winding
+-- down and it won't be representative anyways.
+--
+-- analysis: this lets us get a range without errors that is long and isn't too
+-- close to the beginning or end.
+-- note that selecting a long range without errors might already bias the
+-- sample: if there's no overflow packet this might imply that instruction
+-- execution was slow and so tracing was able to keep up.
+--
+-- Eventually I'll need to find a way to select ranges at random and compare them to see if this is true.
+with range_starts as (
+    select id, time from samples_view where branch_type_name='trace begin'
+    UNION ALL
+    select id, time
+    from samples_view
+    WHERE
+        time = (select min(time) from samples_view where insn_count > 0 or cyc_count > 0) 
+        AND (insn_count > 0 or cyc_count > 0)
+)
+, range_starts_with_next as (
+    select
+        id,
+        time,
+        lead(id) over (order by id) as next_id,
+        lead(time) over (order by id) as next_time
+    from range_starts
+)
+, timestamped_samples as (
+    select
+        id,
+        time
+    from samples_view
+    where insn_count > 0 or cyc_count > 0
+)
+, ranges as (
+    select
+    -- contains all possible timestamped samples in the range.  We'll take the max time next
+        r.time as start_time,
+        (select max(s.time) from timestamped_samples as s where s.time < r.next_time) as end_time
+    FROM
+        range_starts_with_next as r
+), ranges_with_duration as (
+    select
+        end_time - start_time as duration,
+        start_time,
+        end_time,
+        (select min(s.id) from timestamped_samples as s where s.time = start_time) as start_id,
+        (select max(s.id) from timestamped_samples as s where s.time = end_time) as end_id,
+        start_time - (select min(s.time) from samples as s where s.time > 0) as time_after_start,
+        (select max(s.time) from samples as s) - end_time as time_to_end
+    from ranges
+)
+select * from ranges_with_duration order by duration desc limit 10
+;
+        
+        
