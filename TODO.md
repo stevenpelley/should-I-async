@@ -21,9 +21,20 @@ Goals and todos:
 ## Current task
 
 cleanup:
+- unminimize the ubuntu image.  Add "man" etc
+- add matplotlib and other python libs via pip
 - create separate perf script to get errors.
+- script adding any indices that I need (samples time)
+- automate building perf
+- maybe figure out running perf in a container
+- installing ipython, matplotlib, numpy
 
-I have a skeleton workflow for profling with pt and producing ipc of time buckets along with error bound.
+I have a skeleton workflow for profiling with pt and producing ipc of time buckets along with error bound.
+I have syscalls calls and the associated syscall kernel function symbol (names the syscall)
+I have a 4 syscall-cycle time range.
+need:
+IPC bucketing to accept a time window.  Buckets need to also have an associated time, not just cycle count.
+plot IPC and syscall call/return annotated with sycall name.
 
 1. turn off frequency scaling.  Repeat perf record (Done)
 1. use perf script callstack+ret to find an interesting time range (steady state; 1-3 iterations).  `sudo perf script --call-ret-trace -C 0`.  We are recording -Se meaning it is a snapshot taken when it ends.  So take a time period near the beginning without tracing errors.  Try up to the first overflow error and see what that gets us.  If it's good then trim it to get the desired duration.  The sqlite data does not contain tracing errors.  Errors are not shown by record and are only exposed by script.  See `sudo perf script --itrace e`.  Note that disabling return compression results in overflows. Need to trade off between getting a long enough sample with better timing info but errors vs not having errors but less precise timing info.  I started looking at kernel code to see if we can get errors exported and it's a bit of a mess (multiple hooks into the python engine, none of which obviously contain errors.  It is a synthesized event.  The synthesized event types corresponding to those in synth_data() "config" are listed in kernel/tools/perf/util/event.h perf_synth_id.  The python script looks only at the first 6; the remaining 3 aren't obviously related to tracing errors.).  Have errors and query to get ranges without errors (done)

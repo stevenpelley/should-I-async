@@ -33,5 +33,8 @@
     "rust/syncserver/Cargo.toml",
     "rust/csgb/Cargo.toml"
   ],
-  "sqlite.logLevel": "DEBUG"
+  "sqlite.logLevel": "DEBUG",
+  "[sql]": {
+    "editor.formatOnSave": false
+  }
 }
