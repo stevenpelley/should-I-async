@@ -16,7 +16,11 @@ with t1 as (
         id,
         time,
         insn_count,
-        cyc_count
+        cyc_count,
+        event,
+        symbol,
+        to_symbol,
+        branch_type_name
     from samples_view
     where insn_count > 0 or cyc_count > 0
 ), t2 as (
@@ -48,7 +52,11 @@ with t1 as (
         cumulative_cyc_count as end_cum_cyc,
         sample_row_number as end_sample_row_number,
         insn_count,
-        cyc_count
+        cyc_count,
+        event,
+        symbol,
+        to_symbol,
+        branch_type_name
     from t2
 )
 select * from t3;

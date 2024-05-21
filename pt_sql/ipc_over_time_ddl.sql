@@ -10,20 +10,12 @@
 DROP TABLE IF EXISTS ipc_buckets;
 CREATE TABLE ipc_buckets AS
 select
-    gs.value as bucket_start_cyc, 
-    gs.value + {bucket_length_cyc} as bucket_end_cyc,
+    generate_series as bucket_start_cyc, 
+    generate_series + {bucket_length_cyc} as bucket_end_cyc,
     {bucket_tick_cyc} as bucket_cycles
 from generate_series(
-    (
-        select max(end_cum_cyc)
-        from timestamped_ranges
-        where end_time < (select min(column1) from time_bounds) -- start time (ns)
-    ),
-    (
-        select min(end_cum_cyc)
-        from timestamped_ranges 
-        where end_time > (select max(column1) from time_bounds) -- end time (ns)
-    ),
+    {start_cycles},
+    {end_cycles},
     {bucket_tick_cyc} -- step (cycles)
     ) as gs
 ;
@@ -112,12 +104,12 @@ with joined_buckets_to_ranges as (
     --   end range insns = insns
     --   double count: start range insns
         *,
-        iif(
+        if(
             is_start_end_same,
             0,
             end_bucket_start_cum_insns - start_bucket_end_cum_insns
         ) as interior_insns,
-        iif(is_start_end_same, start_bucket_insn_count, 0) as linear_and_conservative_double_count,
+        if(is_start_end_same, start_bucket_insn_count, 0) as linear_and_conservative_double_count,
         start_bucket_insn_count * (start_bucket_end_cum_cyc - bucket_start_cyc) / cast(start_bucket_cyc_count as REAL) as linear_interp_start_insns,
         end_bucket_insn_count * (bucket_end_cyc - end_bucket_start_cum_cyc) / cast(end_bucket_cyc_count as REAL) as linear_interp_end_insns
     from joined_buckets_to_ranges
@@ -145,7 +137,7 @@ with joined_buckets_to_ranges as (
                 ((bucket_start_cyc - cast(start_bucket_start_cum_cyc as real)) /
                     start_bucket_cyc_count) -- percentage through start range
             )
-            as biginteger
+            as uhugeint
         ) as bucket_start_time,
         end_bucket_start_time + cast(
             (
@@ -153,7 +145,7 @@ with joined_buckets_to_ranges as (
                 ((bucket_end_cyc - cast(end_bucket_start_cum_cyc as real)) /
                     end_bucket_cyc_count) -- percentage through start range
             )
-            as biginteger
+            as uhugeint
         ) as bucket_end_time,
         *
     from buckets_ipc

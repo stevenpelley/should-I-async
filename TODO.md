@@ -20,14 +20,38 @@ Goals and todos:
 
 ## Current task
 
+some sample performance numbers:
+2.0 GHz (frequency scaling disabled)
+single core (taskset -a -c 0)
+1 task pair echoing
+
+async 10s:
+without perf 3133534 = 313k/s = 3.19us per iteration / 1.60us per syscall
+with perf 2444146 = 244k/s = 4.10us per iteration / 2.05us per syscall
+78%.  22% slowdown
+without return compression 2944186 = 294k/s = 3.40us per iteration / 1.70us per syscall
+94%.  6% slowdown
+
+sync 20s:
+without perf 1376064 = 137k/s = 7.30us per iteration / 3.65 per syscall+context switch
+with perf 892900 = 89k/s = 11.24us per iteration / 5.62us per syscall+context switch
+65%.  35% slowdown
+without return compression 958179 = 96k/s = 10.42us per iteration / 5.21us per syscall+context switch
+70%.  30% slowdown
+
+no-perf async is 2.28x faster than no-perf sync.
+
+
 cleanup:
 - unminimize the ubuntu image.  Add "man" etc
-- add matplotlib and other python libs via pip
+- add matplotlib and other python libs via pip.  pandas.  ipympl
 - create separate perf script to get errors.
 - script adding any indices that I need (samples time)
 - automate building perf
 - maybe figure out running perf in a container
 - installing ipython, matplotlib, numpy
+- datawrangler
+- file duckdb bug for ASOF JOIN pushed predicates
 
 I have a skeleton workflow for profiling with pt and producing ipc of time buckets along with error bound.
 I have syscalls calls and the associated syscall kernel function symbol (names the syscall)

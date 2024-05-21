@@ -76,7 +76,7 @@ DROP VIEW IF EXISTS syscall_calls;
 CREATE VIEW syscall_calls AS
 select
     *
-from calls_view_2 INNER JOIN syscall_call_path_to_syscall_kernel_name as syscalls USING (call_path_id)
+from calls_view INNER JOIN syscall_call_path_to_syscall_kernel_name as syscalls USING (call_path_id)
 order by id
 ;
 
@@ -87,14 +87,14 @@ select
     call_time as time,
     syscall_kernel_name
 from syscall_calls
-where call_time between (select min(column1) from time_bounds) AND (select max(column1) from time_bounds)
+where call_time between {start_ns} AND {end_ns}
 UNION ALL
 select
     'RET' as event,
     return_time as time,
     syscall_kernel_name
 from syscall_calls
-where return_time between (select min(column1) from time_bounds) AND (select max(column1) from time_bounds)
+where return_time between {start_ns} AND {end_ns}
 ;
 
 
