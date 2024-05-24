@@ -1,14 +1,4 @@
-
-DROP INDEX IF EXISTS samples_time;
-CREATE INDEX samples_time ON samples (time);
-
-DROP INDEX IF EXISTS pcpid_idx;
-CREATE INDEX pcpid_idx ON calls (parent_call_path_id);
-DROP INDEX IF EXISTS pid_idx;
-CREATE INDEX pid_idx ON calls (parent_id);
-
-DROP TABLE IF EXISTS timestamped_ranges;
-CREATE TABLE timestamped_ranges AS
+CREATE OR REPLACE TABLE timestamped_ranges AS
 with t1 as (
     select
     -- only care about the samples where we have a cycle or instruction count,
@@ -60,6 +50,3 @@ with t1 as (
     from t2
 )
 select * from t3;
-
-CREATE UNIQUE INDEX timestamped_ranges_idx_start_cum_cyc on timestamped_ranges (start_cum_cyc);
-CREATE UNIQUE INDEX timestamped_ranges_idx_end_cum_cyc on timestamped_ranges (end_cum_cyc);

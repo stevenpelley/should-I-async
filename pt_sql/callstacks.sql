@@ -98,6 +98,8 @@ where return_time between {start_ns} AND {end_ns}
 ;
 
 
+-- old investigation
+
 --select
 --    id,
 --    call_path_id,

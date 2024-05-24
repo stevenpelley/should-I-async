@@ -20,6 +20,14 @@ Goals and todos:
 
 ## Current task
 
+switch to sync.  This is the harder and arguably more important case.
+Repeat.
+Highlight syscalls, scheduling, perf overhead function calls
+Try to lower perf overhead while still getting useful precision:
+1. turn off return compression
+2. --no-switch-events
+3. address space filter to look only at certain areas.  Stitch together if necessary.
+
 some sample performance numbers:
 2.0 GHz (frequency scaling disabled)
 single core (taskset -a -c 0)
@@ -43,15 +51,8 @@ no-perf async is 2.28x faster than no-perf sync.
 
 
 cleanup:
-- unminimize the ubuntu image.  Add "man" etc
-- add matplotlib and other python libs via pip.  pandas.  ipympl
-- create separate perf script to get errors.
-- script adding any indices that I need (samples time)
 - automate building perf
 - maybe figure out running perf in a container
-- installing ipython, matplotlib, numpy
-- datawrangler
-- file duckdb bug for ASOF JOIN pushed predicates
 
 I have a skeleton workflow for profiling with pt and producing ipc of time buckets along with error bound.
 I have syscalls calls and the associated syscall kernel function symbol (names the syscall)
