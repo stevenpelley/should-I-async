@@ -20,20 +20,39 @@ Goals and todos:
 
 ## Current task
 
+Highlight syscalls, scheduling, context switches, perf overhead function calls
+make sure the timeline events only include the scheduled thread
+The system calls (of course) always interlap between the 2 threads, so showing
+calls that start or end during the sample isn't helpful.
+need to either:
+1. show a timeline per thread, with a annotation for when the thread is scheduled
+2. show only call-spans for when the thread is active (between an "in" switch and the following "out" switch)
+per-thread might be easier and clearer.  There shouldn't be too many threads for these timelines
+
+plan:
+the set of threads comes from incoming and outgoing threads of context switches
+during the window and the most recent preceding.
+For each draw a thin bounding box of 2 horizontal lines.  vlines and vspans will be between these lines.
+Center a ylabel for each thread between these lines.
+Draw spans/calls and context switches on each thread.
+Gray out or otherwise signify when a thread is not scheduled (or _is_
+scheduled?).  I envision this being a rectangle drawn over the other spans/lines
+in white or black with some non-1.0 alpha.
+Draw errors (overflows) across all threads
+
 automate building perf, running perf, collecting data, collecting basic run stats.  Organize data for multiple runs and how the notebook will access these and switch between them.
 
 Move common python code into a package.
 
-examine distribution of loop latency as return-from-read-syscall to next return-from-read-syscall to see if perf slowdown comes from slowdown on every iteration or due to rare long delays.
-
 switch to sync.  This is the harder and more important case.
 
-Highlight syscalls, scheduling, context switches, perf overhead function calls
 
 Try to lower perf overhead while still getting useful precision:
 1. turn off return compression
 2. --no-switch-events
 3. address space filter to look only at certain areas or filter out calls.  Stitch together if necessary or use to validate performance on complete runs.
+
+examine distribution of iteration latency across different configurations to determine if the perf overhead is even throughout the sample or some small number of large delays.
 
 some sample performance numbers:
 2.0 GHz (frequency scaling disabled)
