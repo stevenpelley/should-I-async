@@ -30,6 +30,10 @@
 		"ghcr.io/devcontainers/features/python:1": {
 			"version": 3.12,
 			"installTools": true
+		},
+		"ghcr.io/eitsupi/devcontainer-features/duckdb-cli:1": {
+			"version": "0.10.3",
+			"extensions": "httpfs,sqlite_scanner"
 		}
 	},
 	"runArgs": [

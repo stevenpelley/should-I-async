@@ -20,13 +20,20 @@ Goals and todos:
 
 ## Current task
 
-switch to sync.  This is the harder and arguably more important case.
-Repeat.
-Highlight syscalls, scheduling, perf overhead function calls
+automate building perf, running perf, collecting data, collecting basic run stats.  Organize data for multiple runs and how the notebook will access these and switch between them.
+
+Move common python code into a package.
+
+examine distribution of loop latency as return-from-read-syscall to next return-from-read-syscall to see if perf slowdown comes from slowdown on every iteration or due to rare long delays.
+
+switch to sync.  This is the harder and more important case.
+
+Highlight syscalls, scheduling, context switches, perf overhead function calls
+
 Try to lower perf overhead while still getting useful precision:
 1. turn off return compression
 2. --no-switch-events
-3. address space filter to look only at certain areas.  Stitch together if necessary.
+3. address space filter to look only at certain areas or filter out calls.  Stitch together if necessary or use to validate performance on complete runs.
 
 some sample performance numbers:
 2.0 GHz (frequency scaling disabled)
