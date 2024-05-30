@@ -55,7 +55,7 @@
 				"donjayamanne.python-extension-pack",
 				"ms-toolsai.jupyter",
 				"evidence.sqltools-duckdb-driver",
-				"ms-toolsai.datawrangle"
+				"ms-toolsai.datawrangler"
 			]
 		}
 	},
