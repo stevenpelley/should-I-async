@@ -28,17 +28,19 @@ need to either:
 1. show a timeline per thread, with a annotation for when the thread is scheduled
 2. show only call-spans for when the thread is active (between an "in" switch and the following "out" switch)
 per-thread might be easier and clearer.  There shouldn't be too many threads for these timelines
-
-plan:
-the set of threads comes from incoming and outgoing threads of context switches
-during the window and the most recent preceding.
-For each draw a thin bounding box of 2 horizontal lines.  vlines and vspans will be between these lines.
-Center a ylabel for each thread between these lines.
-Draw spans/calls and context switches on each thread.
-Gray out or otherwise signify when a thread is not scheduled (or _is_
-scheduled?).  I envision this being a rectangle drawn over the other spans/lines
-in white or black with some non-1.0 alpha.
-Draw errors (overflows) across all threads
+Since the point is to only explain fluctuations in IPC, not to describe the flow
+of execution, let's do a single timeline.
+Need to get call ranges as the intersection, per active thread (join on thread
+id), of an interval with tid from "switch in" to "switch out" and an interval
+from "call" to "return".
+This is now the 2nd time I'm calculating overlapping ranges.  How do we make
+this calculation/transform generic?
+SQL: some sort of parameterized view or table function?  Can't find anything.
+In snowflake can pass a query reference (or table reference) to a stored
+procedure, but cannot do the same for a UDTF or view.  Don't see this capability
+in other SQL databases.
+Dataframes: a function that accepts 2 dataframes and returns 1.  Might need to
+do this and just get used to mixing dataframe and SQL.
 
 automate building perf, running perf, collecting data, collecting basic run stats.  Organize data for multiple runs and how the notebook will access these and switch between them.
 
