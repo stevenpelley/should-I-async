@@ -12,4 +12,4 @@ harness/golang/container1
 .devcontainer/personalPostCreate.sh
 harness/docker_build.log
 docker_build.log
-intel_proc_trace/databases/*
+intel_proc_trace/databases/*db
