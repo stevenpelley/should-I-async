@@ -1,50 +1,63 @@
 # %%
-# imports
+# definitions
 
 import numpy
-import collections
-import matplotlib
 from matplotlib import pyplot as plt
+import matplotlib
+import iptdataframes.util as iptutil
 import duckdb
-
-# %%
-# setup
+import collections
+conn = None
 
 # set which database file to use
-# db_file = "databases/pt.duckdb"
-db_file = "databases/sync.duckdb"
+# db_file = "databases/async.duckdb"
+# db_file = "databases/async_retcomp.duckdb"
+# db_file = "databases/sync.duckdb"
+db_file = "databases/sync_retcomp_kernelonly_noswitchevents.duckdb"
+
+if conn != None:
+    conn.close()
+conn = iptutil.SqlUtil(duckdb.connect(db_file))
 
 # set up the moving average
 window_size = 250
 
+# throw out longest samples totalling 1% of time for cdf
+cumulative_longest_time_to_discard = 0.01
+
+sample_count = conn.execute('''--sql
+select count(*) from samples
+;''')
+sample_count
+
+# %%
+# setup
+
 # load the time bounds and figure out where our plots should focus.
-with duckdb.connect(db_file) as con:
-    with open("sql/timestamped_ranges.sql") as script:
-        sql_script = script.read()
-    [con.execute(s) for s in con.extract_statements(sql_script)]
+with open("sql/timestamped_ranges.sql") as script:
+    conn.execute_script(script.read())
+    sql_script = script.read()
 
-    # set the time bounds
-    # calculate ipc over buckets
-    # start_ns, end_ns = 4472714308357, 4472714316324
+# set the time bounds
+# calculate ipc over buckets
+# start_ns, end_ns = 4472714308357, 4472714316324
 
-    con.execute('''--sql
+first_time = conn.execute('''--sql
 SELECT min(end_time)
 FROM timestamped_ranges
 WHERE end_time > 0
-;''')
-    first_time = con.fetchone()[0]
+;''').iloc[0, 0]
 
-    con.execute('''--sql
+last_time = conn.execute('''--sql
 SELECT max(end_time)
 FROM timestamped_ranges
-;''')
-    last_time = con.fetchone()[0]
+;''').iloc[0, 0]
 
-    start_ns = int(first_time + ((last_time - first_time) / 2))
-    duration_ns = 15_000
-    end_ns = start_ns + duration_ns
+start_ns = int(first_time + ((last_time - first_time) / 2))
+duration_ns = 15_000
+end_ns = start_ns + duration_ns
 
-    con.execute('''--sql
+conn.execute('''--sql
 CREATE OR REPLACE TABLE time_bounds AS
 SELECT
     col0 AS ns,
@@ -55,35 +68,90 @@ SELECT
 FROM (VALUES ({}), ({}))
 ;'''.format(start_ns, end_ns))
 
-    con.execute('''--sql
+range_data = conn.execute('''--sql
 SELECT cyc
 FROM time_bounds
 ORDER BY cyc
 ;''')
-    range_data = con.fetchall()
-    start_cycles = range_data[0][0]
-    end_cycles = range_data[1][0]
+start_cycles, end_cycles = map(int, range_data.iloc[:, 0])
 
 # %%
 # timestamped ranges
 
 # perform data preparation.  This makes faster to work on plots so that each
 # attempt doesn't have to wait for queries
-with duckdb.connect(db_file) as con:
-    # locate syscalls
-    with open("sql/callstacks.sql") as script:
-        text = script.read()
-        sql_script = text.format(**{
-            "start_ns": start_ns,
-            "end_ns": end_ns,
-        })
-    [con.execute(s) for s in con.extract_statements(sql_script)]
 
-    with open('sql/cdf.sql') as script:
-        sql_script = script.read()
-    [con.execute(s) for s in con.extract_statements(sql_script)]
+# locate syscalls
+with open("sql/callstacks.sql") as script:
+    text = script.read()
+    sql_script = text.format(**{
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+    })
+    conn.execute_script(sql_script)
 
-    con.execute('''--sql
+conn.execute('''--sql
+CREATE OR REPLACE VIEW samples_for_cdf AS
+WITH t1 as (
+    SELECT
+        insn_count,
+        cyc_count
+    FROM timestamped_ranges
+    WHERE branch_type_name <> 'trace begin'
+), t2 as (
+    SELECT
+        insn_count,
+        cyc_count,
+        sum(cyc_count) OVER (ORDER BY cyc_count DESC) as cum_cycles,
+        cum_cycles / cast( (select sum(cyc_count) from t1) AS REAL) as cum_cycles_perc
+    FROM t1
+)
+SELECT
+    insn_count,
+    cyc_count,
+    cum_cycles,
+    cum_cycles_perc
+FROM t2
+WHERE cum_cycles_perc > {cumulative_longest_time_to_discard}
+;'''.format(cumulative_longest_time_to_discard=cumulative_longest_time_to_discard))
+
+conn.execute('''--sql
+CREATE OR REPLACE TABLE range_cdf as
+with t1 as (
+    select
+        cyc_count,
+        count(*) c,
+        count(*) * cyc_count as weighted_c,
+        count(*) FILTER (WHERE insn_count <= 1) as c_insns_5,
+        count(*) FILTER (WHERE insn_count <= 20) as c_insns_25,
+        count(*) FILTER (WHERE insn_count <= 100) as c_insns_125
+    from samples_for_cdf
+    group by cyc_count
+), t2 as (
+    select
+        *,
+        sum(c) OVER win as nonnormalized_cdf,
+        sum(weighted_c) OVER win as nonnormalized_weighted_cdf,
+        cast(c_insns_5 as real) / c as perc_insns_5,
+        cast(c_insns_25 as real) / c as perc_insns_25,
+        cast(c_insns_125 as real) / c as perc_insns_125
+    from t1
+    WINDOW win as (order by cyc_count range unbounded preceding)
+), t3 as (
+    select
+        cyc_count,
+        cast(nonnormalized_cdf as real) / (select max(nonnormalized_cdf) from t2) as cdf,
+        cast(nonnormalized_weighted_cdf as real) / (select max(nonnormalized_weighted_cdf) from t2) as weighted_cdf,
+        perc_insns_5 as perc_insns_5_stacked,
+        perc_insns_25 - perc_insns_5 as perc_insns_25_stacked,
+        perc_insns_125 - perc_insns_25 as perc_insns_125_stacked,
+        1.0 - perc_insns_125 as perc_insns_125_plus_stacked
+    from t2
+)
+select * from t3
+;''')
+
+conn.execute('''--sql
 -- first treat this point as the leading edge of the sliding window
 -- duckdb is incorrectly pushing filters into the ASOF join and then giving an error.
 -- materialize this in a temp table and then filter that.
@@ -167,16 +235,16 @@ FROM t1
 --    -- the first SELECT of the UNION ALL already produced this point
 --    trailing_end_cum_cyc <> leading_end_cum_cyc - {window_size}
 ;'''.format(
-        window_size=window_size
-    ))
+    window_size=window_size
+))
 
-    con.execute('''--sql
+conn.execute('''--sql
 CREATE OR REPLACE TABLE ipc_spans AS
 with t1 as (
     SELECT
         *
     FROM sliding_window
-    WHERE NOT (side = 'trailing' AND is_span_aliased)
+WHERE NOT (side = 'trailing' AND is_span_aliased)
 ), t2 as (
     -- calculate instructions and cycles as of the last (latest/leading edge)
     -- window in this span
@@ -272,36 +340,126 @@ FROM t3
 ORDER BY window_end_cum_cyc
 ;'''.format(window_size=window_size))
 
+# suppress printing
+pass
+
 # %%
+# time series prep
 
-# %matplotlib widget
-
-with duckdb.connect(db_file) as con:
-    # convert cyc to fractional ns and get the cyc time bounds
-    con.execute('''--sql
-SELECT ns, cyc
+# convert cyc to fractional ns and get the cyc time bounds
+time_cyc_data = conn.execute('''--sql
+SELECT ns::ubigint, cyc::ubigint
 FROM time_bounds
 ORDER BY cyc
 ;''')
-    data = con.fetchall()
-    (start_ns, start_cyc) = data[0]
-    (end_ns, end_cyc) = data[1]
-    ns_rate = float(end_ns - start_ns) / (end_cyc - start_cyc)
+((start_ns, start_cyc,), (end_ns, end_cyc,)) = time_cyc_data.iloc
+ns_rate = float(end_ns - start_ns) / (end_cyc - start_cyc)
 
-    def duration_cyc_to_ns(duration_cyc):
-        return duration_cyc * ns_rate
 
-    def time_cyc_to_ns(cyc):
-        return start_ns + duration_cyc_to_ns(cyc - start_cyc)
+def duration_cyc_to_ns(duration_cyc):
+    return duration_cyc * ns_rate
 
-    plt.close()
-    fig, (ax1, ax2, ax3) = plt.subplots(
-        nrows=3,
-        sharex=True,
-        layout='constrained')
 
-    # plot 1: raw timestamped ranges
-    con.execute('''--sql
+def time_cyc_to_ns(cyc):
+    return start_ns + duration_cyc_to_ns(cyc - start_cyc)
+
+
+# %%
+# syscalls
+
+conn.execute('''--sql
+WITH RECURSIVE call_hierarchy(
+        group_id,
+        id,
+        parent_id,
+        depth,
+        call_path_id,
+        call_time,
+        return_time,
+        ) as (
+    -- base case
+    SELECT
+        id,
+        id,
+        parent_id,
+        0,
+        call_path_id,
+        call_time,
+        return_time,
+    FROM calls
+
+    UNION ALL
+
+    SELECT
+        children.group_id,
+        parents.id,
+        parents.parent_id,
+        children.depth + 1,
+        parents.call_path_id,
+        parents.call_time,
+        parents.return_time,
+    FROM call_hierarchy AS children
+        INNER JOIN calls AS parents
+        ON children.parent_id = parents.id
+    -- 0 has parent_id 0, so filter this out so that it terminates
+    WHERE children.id <> 0
+), call_hierarchy_with_symbols as (
+    SELECT
+        call_hierarchy.*,
+        call_paths.symbol_id AS symbol_id,
+        symbols.name         AS symbol,
+        symbols.dso_id       AS dso_id,
+        dsos.short_name      AS dso,
+    FROM call_hierarchy
+        LEFT JOIN call_paths ON call_hierarchy.call_path_id = call_paths.id
+        LEFT JOIN symbols    ON call_paths.symbol_id = symbols.id
+        LEFT JOIN dsos       ON symbols.dso_id = dsos.id
+), filtered as (
+SELECT *
+FROM call_hierarchy_with_symbols
+WHERE
+    ((call_time BETWEEN {start_ns} AND {end_ns})
+    OR (return_time BETWEEN {start_ns} AND {end_ns}))
+), agged AS (
+    SELECT
+        group_id,
+        max(depth) AS d,
+        first(call_time ORDER BY depth) AS first_call_time,
+        first(return_time ORDER BY depth) AS first_return_time,
+        first(symbol ORDER BY depth) AS first_symbol,
+        first(dso ORDER BY depth) as first_dso,
+        last(call_time ORDER BY depth) AS last_call_time,
+        last(return_time ORDER BY depth) AS last_return_time,
+        last(symbol ORDER BY depth) AS last_symbol,
+        last(dso ORDER BY depth) as last_dso,
+        array_agg(symbol ORDER BY depth) as symbol_list,
+        any_value(call_time) FILTER (depth = 3) as syscall_entry_call_time,
+        any_value(return_time) FILTER (depth = 3) as syscall_entry_return_time,
+    FROM filtered 
+    GROUP BY group_id
+    HAVING 1=1
+        AND list_slice(symbol_list, 2, 4) = list_value('x64_sys_call', 'do_syscall_64', 'entry_SYSCALL_64')
+)
+SELECT
+    syscall_entry_call_time AS call_time,
+    syscall_entry_return_time AS return_time,
+    first_symbol AS syscall_kernel_name,
+FROM agged
+ORDER BY call_time
+;'''.format(end_ns=end_ns, start_ns=start_ns))
+
+# %%
+# time series plots
+
+# %matplotlib widget
+plt.close()
+fig, (ax1, ax2, ax3) = plt.subplots(
+    nrows=3,
+    sharex=True,
+    layout='constrained')
+
+# plot 1: raw timestamped ranges
+range_data = conn.execute('''--sql
 SELECT
     start_cum_cyc,
     end_cum_cyc,
@@ -309,118 +467,191 @@ SELECT
     cyc_count,
 FROM timestamped_ranges
 WHERE end_cum_cyc BETWEEN {} AND {}
-order by end_cum_cyc
+ORDER BY end_cum_cyc
 ;'''.format(start_cyc, end_cyc))
-    range_data = con.df()
-    range_data['start_ns'] = time_cyc_to_ns(range_data['start_cum_cyc'])
-    range_data['end_ns'] = time_cyc_to_ns(range_data['end_cum_cyc'])
-    ax1.hlines(
-        y='ipc',
-        xmin='start_ns',
-        xmax='end_ns',
-        data=range_data,
-    )
-    ax1.set_title('Individual timestamped samples')
-    ax1.set_ylabel('IPC')
+range_data['start_ns'] = time_cyc_to_ns(range_data['start_cum_cyc'])
+range_data['end_ns'] = time_cyc_to_ns(range_data['end_cum_cyc'])
+ax1.hlines(
+    y='ipc',
+    xmin='start_ns',
+    xmax='end_ns',
+    data=range_data,
+)
+ax1.set_title('Individual timestamped samples')
+ax1.set_ylabel('IPC')
 
-    # plot 2: rolling average and error bounds
-    con.execute('''--sql
+# plot 2: rolling average and error bounds
+span_data = conn.execute('''--sql
 SELECT *
 FROM ipc_spans
 WHERE window_end_cum_cyc BETWEEN {} AND {}
 ORDER BY window_end_cum_cyc
 ;'''.format(start_cyc, end_cyc))
-    span_data = con.df()
-    span_data['end_ns'] = time_cyc_to_ns(span_data['window_end_cum_cyc'])
+span_data['end_ns'] = time_cyc_to_ns(span_data['window_end_cum_cyc'])
 
-    plot_handle = ax2.plot(
-        'end_ns',
-        'end_linear_interp_ipc',
-        data=span_data,
-        label='interpolated ipc')
+plot_handle = ax2.plot(
+    'end_ns',
+    'end_linear_interp_ipc',
+    data=span_data,
+    label='interpolated ipc')
 
-    # plot the ipc range rectangles
-    span_data['span_start_ns'] = time_cyc_to_ns(span_data['span_start_cyc'])
-    span_data['span_width_ns'] = duration_cyc_to_ns(
-        span_data['span_width_cyc'])
-    span_data['ipc_range'] = span_data['optimistic_ipc'] - \
-        span_data['conservative_ipc']
+# plot the ipc range rectangles
+span_data['span_start_ns'] = time_cyc_to_ns(span_data['span_start_cyc'])
+span_data['span_width_ns'] = duration_cyc_to_ns(
+    span_data['span_width_cyc'])
+span_data['ipc_range'] = span_data['optimistic_ipc'] - \
+    span_data['conservative_ipc']
 
-    patches = []
-    for index, row in span_data.iterrows():
-        patches.append(matplotlib.patches.Rectangle(
-            (row['span_start_ns'], row['conservative_ipc'],),
-            row['span_width_ns'],
-            row['ipc_range'],
-        ))
-    patches_collection = matplotlib.collections.PatchCollection(
-        patches,
-        alpha=0.5,
-        color='tab:cyan')
-    ax2.add_collection(patches_collection)
-    proxy_patch = matplotlib.patches.Patch(
-        alpha=0.5,
-        color='tab:cyan',
-        label='ipc error bound')
+patches = []
+for index, row in span_data.iterrows():
+    patches.append(matplotlib.patches.Rectangle(
+        (row['span_start_ns'], row['conservative_ipc'],),
+        row['span_width_ns'],
+        row['ipc_range'],
+    ))
+patches_collection = matplotlib.collections.PatchCollection(
+    patches,
+    alpha=0.5,
+    color='tab:cyan')
+ax2.add_collection(patches_collection)
+proxy_patch = matplotlib.patches.Patch(
+    alpha=0.5,
+    color='tab:cyan',
+    label='ipc error bound')
 
-    # draw in individual ranges with durations exceeding some threshold
-    range_data['start_ns'] = time_cyc_to_ns(range_data['start_cum_cyc'])
-    range_data['end_ns'] = time_cyc_to_ns(range_data['end_cum_cyc'])
+# draw in individual ranges with durations exceeding some threshold
+range_data['start_ns'] = time_cyc_to_ns(range_data['start_cum_cyc'])
+range_data['end_ns'] = time_cyc_to_ns(range_data['end_cum_cyc'])
 
-    cyc_limit = window_size
-    long_range_data = range_data[range_data.cyc_count > cyc_limit]
-    hlines_handle = ax2.hlines(
-        y='ipc',
-        xmin='start_ns',
-        xmax='end_ns',
-        data=long_range_data,
-        color='r',
-        label='ranges > {}'.format(cyc_limit),
-    )
-    ax2.set_title('Rolling average (window={} cycles)'.format(window_size))
-    ax2.set_ylabel('IPC')
-    ax2.legend(
-        handles=[plot_handle[0], hlines_handle, proxy_patch],
-    )
+cyc_limit = window_size
+long_range_data = range_data[range_data.cyc_count > cyc_limit]
+hlines_handle = ax2.hlines(
+    y='ipc',
+    xmin='start_ns',
+    xmax='end_ns',
+    data=long_range_data,
+    color='r',
+    label='ranges > {}'.format(cyc_limit),
+)
+ax2.set_title('Rolling average (window={} cycles)'.format(window_size))
+ax2.set_ylabel('IPC')
+ax2.legend(
+    handles=[plot_handle[0], hlines_handle, proxy_patch],
+)
 
-    con.execute('''--sql
-SELECT
-    call_time,
-    return_time,
-    syscall_kernel_name,
-FROM syscall_calls
+event_data = conn.execute('''--sql
+WITH RECURSIVE call_hierarchy(
+        group_id,
+        id,
+        parent_id,
+        depth,
+        call_path_id,
+        call_time,
+        return_time,
+        ) as (
+    -- base case
+    SELECT
+        id,
+        id,
+        parent_id,
+        0,
+        call_path_id,
+        call_time,
+        return_time,
+    FROM calls
+
+    UNION ALL
+
+    SELECT
+        children.group_id,
+        parents.id,
+        parents.parent_id,
+        children.depth + 1,
+        parents.call_path_id,
+        parents.call_time,
+        parents.return_time,
+    FROM call_hierarchy AS children
+        INNER JOIN calls AS parents
+        ON children.parent_id = parents.id
+    -- 0 has parent_id 0, so filter this out so that it terminates
+    WHERE children.id <> 0
+), call_hierarchy_with_symbols as (
+    SELECT
+        call_hierarchy.*,
+        call_paths.symbol_id AS symbol_id,
+        symbols.name         AS symbol,
+        symbols.dso_id       AS dso_id,
+        dsos.short_name      AS dso,
+    FROM call_hierarchy
+        LEFT JOIN call_paths ON call_hierarchy.call_path_id = call_paths.id
+        LEFT JOIN symbols    ON call_paths.symbol_id = symbols.id
+        LEFT JOIN dsos       ON symbols.dso_id = dsos.id
+), filtered as (
+SELECT *
+FROM call_hierarchy_with_symbols
 WHERE
-    (call_time BETWEEN {start_ns} AND {end_ns})
-    OR (return_time BETWEEN {start_ns} AND {end_ns})
+    ((call_time BETWEEN {start_ns} AND {end_ns})
+    OR (return_time BETWEEN {start_ns} AND {end_ns}))
+), agged AS (
+    SELECT
+        group_id,
+        max(depth) AS d,
+        first(call_time ORDER BY depth) AS first_call_time,
+        first(return_time ORDER BY depth) AS first_return_time,
+        first(symbol ORDER BY depth) AS first_symbol,
+        first(dso ORDER BY depth) as first_dso,
+        last(call_time ORDER BY depth) AS last_call_time,
+        last(return_time ORDER BY depth) AS last_return_time,
+        last(symbol ORDER BY depth) AS last_symbol,
+        last(dso ORDER BY depth) as last_dso,
+        array_agg(symbol ORDER BY depth) as symbol_list,
+        any_value(call_time) FILTER (depth = 3) as syscall_entry_call_time,
+        any_value(return_time) FILTER (depth = 3) as syscall_entry_return_time,
+    FROM filtered 
+    GROUP BY group_id
+    HAVING 1=1
+        AND list_slice(symbol_list, 2, 4) = list_value('x64_sys_call', 'do_syscall_64', 'entry_SYSCALL_64')
+)
+SELECT
+    syscall_entry_call_time AS call_time,
+    syscall_entry_return_time AS return_time,
+    first_symbol AS syscall_kernel_name,
+FROM agged
 ORDER BY syscall_kernel_name
 ;'''.format(end_ns=end_ns, start_ns=start_ns))
-    event_data = con.fetchall()
 
-    d = collections.defaultdict(list)
-    for t in event_data:
-        label = t[2].lstrip('_')
-        d[label].append(t[0:2])
-    labels = []
-    handles = []
-    hatches = ['/', '\\', 'x']
-    colors = ['orange', 'green', 'blue', 'red']
-    span_type_count = 0
-    for label, spans in d.items():
-        labels.append(label)
-        for i, span in enumerate(spans):
-            handle = ax3.axvspan(
-                xmin=span[0],
-                xmax=span[1],
-                facecolor=colors[span_type_count % len(colors)],
-                hatch=hatches[span_type_count % len(hatches)]
-            )
-            if i == 0:
-                handles.append(handle)
-        span_type_count += 1
+d = collections.defaultdict(list)
+for t in event_data.itertuples(index=False):
+    label = t[2].lstrip('_')
+    d[label].append(t[0:2])
+labels = []
+handles = []
+hatches = ['/', '\\', 'x']
+colors = ['orange', 'green', 'blue', 'red']
+span_type_count = 0
+for label, spans in d.items():
+    labels.append(label)
+    for i, span in enumerate(spans):
+        handle = ax3.axvspan(
+            xmin=span[0],
+            xmax=span[1],
+            facecolor=colors[span_type_count % len(colors)],
+            hatch=hatches[span_type_count % len(hatches)]
+        )
+        if i == 0:
+            handles.append(handle)
+    span_type_count += 1
 
-    # find and plot overflow errors
-    con.execute(
-        '''--sql
+
+# find and plot overflow errors
+have_errors_table = conn.execute('''--sql
+select count(*)
+from information_schema.tables
+where table_name = 'auxtrace_errors'
+;''').iloc[0, 0] > 0
+
+if have_errors_table:
+    conn.execute('''--sql
 -- duckdb incorrectly pushes predicates into the ASOF join, where they join the
 -- left table to the incorrect rows of the right table instead of filtering
 -- those rows.  Create a temp table and then filter later instead
@@ -440,7 +671,7 @@ WHERE ae.msg='Overflow packet'
 ORDER BY tr.end_cum_cyc
 ;''')
 
-    con.execute(
+    errors = conn.execute(
         '''--sql
 SELECT
     start_time,
@@ -452,11 +683,10 @@ WHERE
     OR end_time BETWEEN {start_ns} AND {end_ns}
 ORDER BY end_cum_cyc
 ;'''.format(start_ns=start_ns, end_ns=end_ns))
-    errors = con.fetchall()
 
     if len(errors) > 0:
         labels.append('trace overflow')
-        for i, err in enumerate(errors):
+        for i, *err in errors.itertuples(index=True):
             handle = ax3.axvspan(
                 xmin=err[0],
                 xmax=err[1],
@@ -467,111 +697,107 @@ ORDER BY end_cum_cyc
                 handles.append(handle)
         span_type_count += 1
 
-    # draw context switches, different label per incoming thread
-    con.execute('''--sql
-SELECT
-    time,
-    tid_in,
-    flags
-FROM context_switches_view
-WHERE time BETWEEN {start_ns} AND {end_ns}
-ORDER BY time
-;'''.format(start_ns=start_ns, end_ns=end_ns))
-    switches = con.fetchall()
+# don't always have context switches
+#    # draw context switches, different label per incoming thread
+#    con.execute('''--sql
+# SELECT
+#    time,
+#    tid_in,
+#    flags
+# FROM context_switches_view
+# WHERE time BETWEEN {start_ns} AND {end_ns}
+# ORDER BY time
+# ;'''.format(start_ns=start_ns, end_ns=end_ns))
+#    switches = con.fetchall()
+#
+#    if len(switches) > 0:
+#        labels.append('context switch')
+#        for i, switch in enumerate(switches):
+#            handle = ax3.axvline(
+#                switch[0],
+#                color='r',
+#            )
+#            if i == 0:
+#                handles.append(handle)
+#        span_type_count += 1
 
-    if len(switches) > 0:
-        labels.append('context switch')
-        for i, switch in enumerate(switches):
-            handle = ax3.axvline(
-                switch[0],
-                color='r',
-            )
-            if i == 0:
-                handles.append(handle)
-        span_type_count += 1
-
-    ax3.legend(
-        handles,
-        labels,
-    )
-    # force the markers to appear at the top
-    ax3.set_yticks([])
-    ax3.set_title('syscall events')
-    ax3.set_xlabel("ns since host boot")
+ax3.legend(
+    handles,
+    labels,
+)
+# force the markers to appear at the top
+ax3.set_yticks([])
+ax3.set_title('syscall events')
+ax3.set_xlabel("ns since host boot")
 
 # %%
 # cdfs
 
-with duckdb.connect(db_file) as con:
-    # 1. calculate the cdf of timestamped range durations in cycles.
-    # 2. plot the distributions as contour lines of instructions or IPC
-    # 3. plot the cdf weighted by duration.  This displays cumulative time spent in
-    # ranges of each duration, not simply frequency.
+# 1. calculate the cdf of timestamped range durations in cycles.
+# 2. plot the distributions as contour lines of instructions or IPC
+# 3. plot the cdf weighted by duration.  This displays cumulative time spent in
+# ranges of each duration, not simply frequency.
 
-    con.execute('select * from range_cdf')
-    range_data = con.fetchall()
+range_data = conn.execute('select * from range_cdf')
+cyc_count, cdf, weighted_cdf, *_ = range_data[range_data['cdf'] > 0.95].T.iloc
 
-    # only look at the top of the cdf.  Where p>.05
-    cyc_count, cdf, weighted_cdf, *perc_insns = zip(*[
-        t for t in range_data
-        if t[1] > 0.95
-    ])
-    plt.close()
-    fig, (ax1, ax2, ax3) = plt.subplots(
-        nrows=3, sharex=True, layout='constrained')
-    ax1.semilogx(cyc_count, cdf)
-    ax1.set_title('CDF of sample range durations (cycles)')
-    ax2.semilogx(cyc_count, weighted_cdf)
-    ax2.set_title('CDF, weighted by duration')
+plt.close()
+fig, (ax1, ax2, ax3) = plt.subplots(
+    nrows=3, sharex=True, layout='constrained')
+ax1.semilogx(cyc_count, cdf)
+ax1.set_title('CDF of sample range durations (cycles)')
+ax2.semilogx(cyc_count, weighted_cdf)
+ax2.set_title('CDF, weighted by duration')
 
-    min_cyc_count = min(cyc_count)
+min_cyc_count = cyc_count.min()
 
-    con.execute("""--sql
+range_data = conn.execute("""--sql
 with t1 as (
-    SELECT
-        cyc_count,
-        insn_count,
-        cast(insn_count as real) / cyc_count as ipc,
-        CASE
-            WHEN insn_count <= 35 THEN 0
-            WHEN insn_count <= 100 THEN 1
-            ELSE 2
-        END AS insn_group
-    from samples_for_cdf
-    where cyc_count >= {min_cyc_count}
-)
 SELECT
     cyc_count,
-    cast(count(*) FILTER (insn_group = 0) * cyc_count as real) /
-        (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_0,
-    cast(count(*) FILTER (insn_group = 1) * cyc_count as real) /
-        (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_1,
-    cast(count(*) FILTER (insn_group = 2) * cyc_count as real) /
-        (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_2,
+    insn_count,
+    cast(insn_count as real) / cyc_count as ipc,
+    CASE
+        WHEN insn_count <= 35 THEN 0
+        WHEN insn_count <= 100 THEN 1
+        ELSE 2
+    END AS insn_group
+from samples_for_cdf
+where cyc_count >= {min_cyc_count}
+)
+SELECT
+cyc_count,
+cast(count(*) FILTER (insn_group = 0) * cyc_count as real) /
+    (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_0,
+cast(count(*) FILTER (insn_group = 1) * cyc_count as real) /
+    (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_1,
+cast(count(*) FILTER (insn_group = 2) * cyc_count as real) /
+    (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_2,
 from t1
 group by cyc_count
 order by cyc_count
 ;""".format(min_cyc_count=min_cyc_count))
-    range_data = con.df()
-    print(range_data)
-    bins = numpy.logspace(
-        numpy.log10(numpy.min(cyc_count)),
-        numpy.log10(numpy.max(cyc_count)),
-        30)
-    kwargs = {
-        'data': range_data,
-        'x': 'cyc_count',
-        'bins': bins,
-        # 'density': True,
-    }
-    ax3.hist(weights='weighted_insn_count_0', label='35', **kwargs)
-    ax3.hist(weights='weighted_insn_count_1', label='100', **kwargs)
-    ax3.hist(weights='weighted_insn_count_2', label='>100', **kwargs)
-    ax3.legend()
-    ax3.set_title(
-        'Perc. time in samples by duration (cycles) and # instructions')
-    ax3.set_ylabel("% time")
-    ax3.set_xlabel("cycles")
+
+bins = numpy.logspace(
+    numpy.log10(numpy.min(cyc_count)),
+    numpy.log10(numpy.max(cyc_count)),
+    30)
+kwargs = {
+    'data': range_data,
+    'x': 'cyc_count',
+    'bins': bins,
+    # 'density': True,
+}
+ax3.hist(weights='weighted_insn_count_0', label='35', **kwargs)
+ax3.hist(weights='weighted_insn_count_1', label='100', **kwargs)
+ax3.hist(weights='weighted_insn_count_2', label='>100', **kwargs)
+ax3.legend()
+ax3.set_title(
+    'Perc. time in samples by duration (cycles) and # instructions')
+ax3.set_ylabel("% time")
+ax3.set_xlabel("cycles")
 
 
 # %%
+# teardown
+conn.close()

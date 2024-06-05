@@ -20,6 +20,67 @@ Goals and todos:
 
 ## Current task
 
+### on plotting events when we don't have context switches and only record kernel mode
+
+we cannot use context switch data since in some trials we do not collect it.
+Use kernel calls that indicate context switches instead.
+investigate what those kernel calls are
+investigate what samples data looks like when only tracing kernel mode.  What
+does the missing user code look like?  Is there an indicator in the samples
+data?
+treat overflow error ranges and non-sampled ranges as 0-instruction ranges.
+Interpolate for cycles count, assuming we don't have cycle count info for those
+ranges.
+plot overflow error ranges, non-sampled ranges, syscalls with call and return,
+kernel scheduling, kernel perf functions, and annotate kernel switch out and
+switch in function call points.
+
+The current syscall_calls view associates the actual syscall call/return call
+path as the syscall because when we had usermode code I (implicitely) made the
+assumption that each distinct stack had a unique syscall, which was defined by
+the usermode function calls.  This is really assuming that no function makes 2
+raw syscalls, especially with different syscall types (which is provided as an
+argument).  The call and call path data does not distinguish between these calls
+(there's no call or symbol offset) and so it wouldn't distinguish between, say,
+a 2nd call instruction and calling a function in a loop.
+
+When we only trace kernel mode all of these syscalls enter as the bottom of the
+stack.  There are no further-down frames from user mode to distinguish them.
+And so every distinct syscall kernel function goes through the same
+entry_SYSCALL_64 call path, 2 in our case.
+
+So instead of treating the entry_SYSCALL_64 path as the marker call path for a
+syscall we're going to have to collect all of the x64_sys_call call paths, scan
+for all the associated calls, and _then_ join to walk up the stack to the
+associated entry_SYSCALL_64 call (all of which have call path id 2)
+
+Done
+
+
+### sync and switch events
+switch events (perf record --switch events, enabled by default with ipt, disable with --no-switch-events) incur a fairly heavy cost on each context switch resulting in a ~30% slowdown.  Unfortunately, this data is required for _any_ userspace decoding.  Without it the decoder doesn't have access to the virtual address mapping or stack and so calls and returns are meaningless.
+
+My choices:
+
+- analyze with the slowdown anyways, annotate time ranges in perf code.
+- analyze only kernel time, which is most of the time anyways.
+- see if there is a way to record the necessary context switch info with ptwrite so that userspace code can be decoded.  If all we need is the incoming tid this should be easy.  If we need more, or if it is expensive to even determine that we need more, then this is substantially harder.
+
+So let's do:
+
+- async, with retcomp.
+- sync, with retcomp and switch-events
+- sync, with retcomp, no-switch-events, kernel-only
+
+### quick journey: switch-events with ptwrite
+Let's look at:
+perf script code to decode ipt.  What information does it use from switch-events?
+kernel code called during context switch.  man perf-record suggests this is PERF_RECORD_SWITCH or PERF_RECORD_SWITCH_CPU_WIDE event types.
+
+this is madness. next
+
+### other
+
 Highlight syscalls, scheduling, context switches, perf overhead function calls
 make sure the timeline events only include the scheduled thread
 The system calls (of course) always interlap between the 2 threads, so showing
@@ -65,17 +126,19 @@ async 10s:
 without perf 3133534 = 313k/s = 3.19us per iteration / 1.60us per syscall
 with perf 2444146 = 244k/s = 4.10us per iteration / 2.05us per syscall
 78%.  22% slowdown
-without return compression 2944186 = 294k/s = 3.40us per iteration / 1.70us per syscall
+with return compression 2944186 = 294k/s = 3.40us per iteration / 1.70us per syscall
 94%.  6% slowdown
 
-sync 20s:
-without perf 1376064 = 137k/s = 7.30us per iteration / 3.65 per syscall+context switch
-with perf 892900 = 89k/s = 11.24us per iteration / 5.62us per syscall+context switch
-65%.  35% slowdown
-without return compression 958179 = 96k/s = 10.42us per iteration / 5.21us per syscall+context switch
-70%.  30% slowdown
+sync 10s:
+without perf 1446123 = 145k/s = 6.92us per iteration / 3.46 per syscall+context switch
+with perf 966484 = 89k/s = 10.34us per iteration / 5.17 per syscall+context switch
+67%.  33% slowdown
+with return compression 958426 = 96k/s = 10.43us per iteration / 5.22us per syscall+context switch
+66%.  34% slowdown
+with return compression and --no-switch-events kernel only 1376355 = 138k/s = 7.27us per iteration / 3.63us per syscall+context switch
+95%.  5% slowdown
 
-no-perf async is 2.28x faster than no-perf sync.
+no-perf async is 2.16x faster than no-perf sync.
 
 
 cleanup:
@@ -196,7 +259,7 @@ using --aux-sample needs to define some other event on which to sample.
 sudo perf record -a --kcore -e intel_pt// -Se -vv timeout 1 taskset -a -c 0 /home/spelley/should-I-async/rust/csgb/target/debug/csgb yield 2
 terrible performance, less than 50% without PT.
 
-exaimine with:
+examine with:
 sudo perf script --call-ret-trace -C 0
 
 want to see where PT is enabled and disabled as well, -F BE

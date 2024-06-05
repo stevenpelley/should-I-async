@@ -29,18 +29,25 @@
 		},
 		"ghcr.io/devcontainers/features/python:1": {
 			"version": 3.12,
-			"installTools": true
+			"installTools": true,
+			"installJupyterlab": true
 		},
 		"ghcr.io/eitsupi/devcontainer-features/duckdb-cli:1": {
 			"version": "0.10.3",
 			"extensions": "httpfs,sqlite_scanner"
 		}
 	},
-	"runArgs": [
-		"--privileged"
-	],
-	"mounts": [
-		"source=/,target=/host-root,type=bind,consistency=cached"
+	// if running perf inside container
+	//"runArgs": [
+	//	"--privileged"
+	//],
+	// access to entire host fs
+	//"mounts": [
+	//	"source=/,target=/host-root,type=bind,consistency=cached"
+	//],
+	// JupyterLab port
+	"forwardPorts": [
+		8888
 	],
 	"customizations": {
 		"vscode": {

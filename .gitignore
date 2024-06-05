@@ -13,3 +13,4 @@ harness/golang/container1
 harness/docker_build.log
 docker_build.log
 intel_proc_trace/databases/*db
+intel_proc_trace/iptdataframes/__pycache__
