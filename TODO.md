@@ -20,7 +20,27 @@ Goals and todos:
 
 ## Current task
 
+I just deleted my whole morning's work:
+locating context switches
+on-cpu-syscalls
+
+plotting on-cpu-syscalls and context switches
+
 ### on plotting events when we don't have context switches and only record kernel mode
+
+Still to calculate and plot:
+perf function overhead in syscalls
+
+Do a basic profiling of syscalls, both when context switching and not.
+I want to be able to highlight important aspects:
+- perf overhead
+- time doing work for the syscall (e.g., read or write a file/socket)
+- time determine what thread to run next
+- time to update scheduler state associated with the context switch
+- time to perform the context switch
+- time to switch between user-kernel mode?
+
+----------
 
 we cannot use context switch data since in some trials we do not collect it.
 Use kernel calls that indicate context switches instead.
@@ -56,6 +76,25 @@ associated entry_SYSCALL_64 call (all of which have call path id 2)
 
 Done
 
+The other calls I need:
+
+- "schedule" in kernel.  Doesn't return until the thread is scheduled again.
+- __perf_event_task_sched_out.  Doesn't return until the thread is scheduled again.  Context switch is performed within.  It's about 500ns from the start of this call until the asm call to switch.  Let's say the time from the start of this until the next call to "perf_event_context_sched_out" is perf overhead
+  The context switch occurs around here so it's a reasonable place to mark it.  Or at the following switch_mm_irqs_off or __switch_to_asm
+- __perf_event_task_sched_in.  371ns after the switch.  Denotes perf overhead.
+- pick_next_task takes only 174ns.  That's interesting.
+
+Now let's take a look at the sample without usermode or context switch perf overhead
+
+It looks like the stack is unwound, at least for the trace, shortly after the context switch.  Function calls end at the context switch.
+I see dequeue_task taking 388 and later pick_next_task taking 218.  Odd that there are functions with similar names.  They don't overlap.
+
+There's an obvious prepare_task_switch right before the asm calls to switch.  Did we see this before?
+No, in fact this is the caller of __perf_event_task_sched_out and helps to validate that the call of this function up until the asm context switch is overhead.
+
+This looks largely similar but without all the perf calls, so let's proceed
+
+What's an skb?  There are long-running functions like skb_release_head_state and consume_skb followed by unix_destruct_scm and unix_write_space
 
 ### sync and switch events
 switch events (perf record --switch events, enabled by default with ipt, disable with --no-switch-events) incur a fairly heavy cost on each context switch resulting in a ~30% slowdown.  Unfortunately, this data is required for _any_ userspace decoding.  Without it the decoder doesn't have access to the virtual address mapping or stack and so calls and returns are meaningless.

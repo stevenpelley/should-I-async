@@ -33,7 +33,7 @@
 			"installJupyterlab": true
 		},
 		"ghcr.io/eitsupi/devcontainer-features/duckdb-cli:1": {
-			"version": "0.10.3",
+			"version": "1.0.0",
 			"extensions": "httpfs,sqlite_scanner"
 		}
 	},

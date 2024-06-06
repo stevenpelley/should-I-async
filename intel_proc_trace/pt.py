@@ -1,5 +1,5 @@
 # %%
-# definitions
+# imports
 
 import numpy
 from matplotlib import pyplot as plt
@@ -9,18 +9,24 @@ import duckdb
 import collections
 conn = None
 
+# %%
+# definitions
+
 # set which database file to use
 # db_file = "databases/async.duckdb"
-# db_file = "databases/async_retcomp.duckdb"
+db_file = "databases/async_retcomp.duckdb"
 # db_file = "databases/sync.duckdb"
-db_file = "databases/sync_retcomp_kernelonly_noswitchevents.duckdb"
+# db_file = "databases/sync_retcomp.duckdb"
+# db_file = "databases/sync_retcomp_kernelonly_noswitchevents.duckdb"
 
-if conn != None:
+if 'conn' in locals() and conn is not None:
     conn.close()
 conn = iptutil.SqlUtil(duckdb.connect(db_file))
 
 # set up the moving average
-window_size = 250
+window_size = 2000
+
+long_sample_limit = 500
 
 # throw out longest samples totalling 1% of time for cdf
 cumulative_longest_time_to_discard = 0.01
@@ -365,93 +371,12 @@ def time_cyc_to_ns(cyc):
 
 
 # %%
-# syscalls
-
-conn.execute('''--sql
-WITH RECURSIVE call_hierarchy(
-        group_id,
-        id,
-        parent_id,
-        depth,
-        call_path_id,
-        call_time,
-        return_time,
-        ) as (
-    -- base case
-    SELECT
-        id,
-        id,
-        parent_id,
-        0,
-        call_path_id,
-        call_time,
-        return_time,
-    FROM calls
-
-    UNION ALL
-
-    SELECT
-        children.group_id,
-        parents.id,
-        parents.parent_id,
-        children.depth + 1,
-        parents.call_path_id,
-        parents.call_time,
-        parents.return_time,
-    FROM call_hierarchy AS children
-        INNER JOIN calls AS parents
-        ON children.parent_id = parents.id
-    -- 0 has parent_id 0, so filter this out so that it terminates
-    WHERE children.id <> 0
-), call_hierarchy_with_symbols as (
-    SELECT
-        call_hierarchy.*,
-        call_paths.symbol_id AS symbol_id,
-        symbols.name         AS symbol,
-        symbols.dso_id       AS dso_id,
-        dsos.short_name      AS dso,
-    FROM call_hierarchy
-        LEFT JOIN call_paths ON call_hierarchy.call_path_id = call_paths.id
-        LEFT JOIN symbols    ON call_paths.symbol_id = symbols.id
-        LEFT JOIN dsos       ON symbols.dso_id = dsos.id
-), filtered as (
-SELECT *
-FROM call_hierarchy_with_symbols
-WHERE
-    ((call_time BETWEEN {start_ns} AND {end_ns})
-    OR (return_time BETWEEN {start_ns} AND {end_ns}))
-), agged AS (
-    SELECT
-        group_id,
-        max(depth) AS d,
-        first(call_time ORDER BY depth) AS first_call_time,
-        first(return_time ORDER BY depth) AS first_return_time,
-        first(symbol ORDER BY depth) AS first_symbol,
-        first(dso ORDER BY depth) as first_dso,
-        last(call_time ORDER BY depth) AS last_call_time,
-        last(return_time ORDER BY depth) AS last_return_time,
-        last(symbol ORDER BY depth) AS last_symbol,
-        last(dso ORDER BY depth) as last_dso,
-        array_agg(symbol ORDER BY depth) as symbol_list,
-        any_value(call_time) FILTER (depth = 3) as syscall_entry_call_time,
-        any_value(return_time) FILTER (depth = 3) as syscall_entry_return_time,
-    FROM filtered 
-    GROUP BY group_id
-    HAVING 1=1
-        AND list_slice(symbol_list, 2, 4) = list_value('x64_sys_call', 'do_syscall_64', 'entry_SYSCALL_64')
-)
-SELECT
-    syscall_entry_call_time AS call_time,
-    syscall_entry_return_time AS return_time,
-    first_symbol AS syscall_kernel_name,
-FROM agged
-ORDER BY call_time
-;'''.format(end_ns=end_ns, start_ns=start_ns))
-
-# %%
 # time series plots
 
 # %matplotlib widget
+
+# plot 1: individual samples
+
 plt.close()
 fig, (ax1, ax2, ax3) = plt.subplots(
     nrows=3,
@@ -481,6 +406,7 @@ ax1.set_title('Individual timestamped samples')
 ax1.set_ylabel('IPC')
 
 # plot 2: rolling average and error bounds
+
 span_data = conn.execute('''--sql
 SELECT *
 FROM ipc_spans
@@ -523,15 +449,15 @@ proxy_patch = matplotlib.patches.Patch(
 range_data['start_ns'] = time_cyc_to_ns(range_data['start_cum_cyc'])
 range_data['end_ns'] = time_cyc_to_ns(range_data['end_cum_cyc'])
 
-cyc_limit = window_size
-long_range_data = range_data[range_data.cyc_count > cyc_limit]
+long_sample_limit
+long_range_data = range_data[range_data.cyc_count > long_sample_limit]
 hlines_handle = ax2.hlines(
     y='ipc',
     xmin='start_ns',
     xmax='end_ns',
     data=long_range_data,
     color='r',
-    label='ranges > {}'.format(cyc_limit),
+    label='ranges > {}'.format(long_sample_limit),
 )
 ax2.set_title('Rolling average (window={} cycles)'.format(window_size))
 ax2.set_ylabel('IPC')
@@ -539,7 +465,10 @@ ax2.legend(
     handles=[plot_handle[0], hlines_handle, proxy_patch],
 )
 
-event_data = conn.execute('''--sql
+# plot 3: significant events timeline
+
+conn.execute('''--sql
+CREATE OR REPLACE TABLE full_syscalls AS
 WITH RECURSIVE call_hierarchy(
         group_id,
         id,
@@ -616,12 +545,132 @@ SELECT
     syscall_entry_call_time AS call_time,
     syscall_entry_return_time AS return_time,
     first_symbol AS syscall_kernel_name,
+    group_id AS call_id,
 FROM agged
-ORDER BY syscall_kernel_name
 ;'''.format(end_ns=end_ns, start_ns=start_ns))
 
+# compute context switches
+
+conn.execute('''--sql
+CREATE OR REPLACE TABLE context_switches AS
+WITH prepare_task_switch AS (
+    SELECT
+        calls.id AS pts_call_id,
+        calls.call_time AS pts_call_time,
+        calls.return_time AS pts_call_return_time,
+    FROM
+        calls
+        LEFT JOIN call_paths ON calls.call_path_id = call_paths.id
+        LEFT JOIN symbols ON call_paths.symbol_id = symbols.id
+        LEFT JOIN dsos ON symbols.dso_id = dsos.id
+    WHERE
+        symbols.name = 'prepare_task_switch'
+        AND dsos.short_name = '[kernel.kallsyms]'
+), switch_mm_irqs_off AS (
+    SELECT
+        calls.id AS smio_call_id,
+        calls.call_time AS smio_call_time,
+        calls.return_time AS smio_call_return_time,
+    FROM
+        calls
+        LEFT JOIN call_paths ON calls.call_path_id = call_paths.id
+        LEFT JOIN symbols ON call_paths.symbol_id = symbols.id
+        LEFT JOIN dsos ON symbols.dso_id = dsos.id
+    WHERE
+        symbols.name = 'switch_mm_irqs_off'
+        AND dsos.short_name = '[kernel.kallsyms]'
+)
+SELECT
+    *
+FROM
+    prepare_task_switch AS pts ASOF
+    LEFT JOIN switch_mm_irqs_off AS smio
+        ON pts.pts_call_time < smio.smio_call_time
+;''')
+
+context_switches = conn.execute('''--sql
+SELECT
+    smio_call_time AS time
+FROM context_switches
+WHERE time BETWEEN {start_ns} AND {end_ns}
+;'''.format(end_ns=end_ns, start_ns=start_ns))
+
+conn.execute('''--sql
+CREATE OR REPLACE TABLE on_cpu_syscalls AS
+WITH in_view_context_switches AS (
+    SELECT
+        smio_call_time AS time,
+        NULL AS name,
+        NULL AS call_id
+    FROM context_switches
+    WHERE time BETWEEN {start_ns} AND {end_ns}
+), range_starts AS (
+    SELECT * from in_view_context_switches
+    
+    UNION ALL
+    
+    SELECT
+        call_time AS time,
+        syscall_kernel_name AS name,
+        call_id AS call_id,
+    FROM full_syscalls
+), range_ends AS (
+    SELECT * from in_view_context_switches
+    
+    UNION ALL
+    
+    SELECT
+        return_time AS time,
+        syscall_kernel_name AS name,
+        call_id AS call_id,
+    FROM full_syscalls
+)
+SELECT
+    range_starts.time AS starts_time,
+    range_starts.name AS starts_name,
+    range_starts.call_id AS starts_call_id,
+    range_ends.time AS ends_time,
+    range_ends.name AS ends_name,
+    range_ends.call_id AS ends_call_id,
+FROM
+    range_starts
+    ASOF JOIN range_ends
+        ON range_ends.time > range_starts.time
+;'''.format(end_ns=end_ns, start_ns=start_ns))
+
+# assert that this looks good
+assert_df = conn.execute('''--sql
+SELECT *
+FROM on_cpu_syscalls
+WHERE
+    (starts_time BETWEEN {start_ns} AND {end_ns}
+        OR ends_time BETWEEN {start_ns} AND {end_ns})
+    AND
+    (
+        (starts_call_id IS NULL AND ends_call_id IS NULL)
+        OR (starts_call_id IS NOT NULL AND ends_call_id IS NOT NULL AND starts_call_id <> ends_call_id)
+    )
+ORDER BY starts_time
+;'''.format(end_ns=end_ns, start_ns=start_ns))
+assert len(assert_df) == 0, (
+    "inconsistent on-cpu syscalls:\n{}".format(assert_df.to_string()))
+
+on_cpu_syscalls = conn.execute('''--sql
+SELECT
+    starts_time,
+    ends_time,
+    coalesce(starts_name, ends_name) AS name
+FROM on_cpu_syscalls
+WHERE
+    (starts_time BETWEEN {start_ns} AND {end_ns}
+        OR ends_time BETWEEN {start_ns} AND {end_ns})
+-- order by name to make legend markers more deterministic
+ORDER BY name
+;'''.format(end_ns=end_ns, start_ns=start_ns))
+
+
 d = collections.defaultdict(list)
-for t in event_data.itertuples(index=False):
+for t in on_cpu_syscalls.itertuples(index=False):
     label = t[2].lstrip('_')
     d[label].append(t[0:2])
 labels = []
@@ -642,6 +691,15 @@ for label, spans in d.items():
             handles.append(handle)
     span_type_count += 1
 
+# plot context switches
+labels.append('context switches')
+for i, *switch in context_switches.itertuples(index=True):
+    handle = ax3.axvline(
+        x=switch[0],
+        color='r'
+    )
+    if i == 0:
+        handles.append(handle)
 
 # find and plot overflow errors
 have_errors_table = conn.execute('''--sql
@@ -695,31 +753,8 @@ ORDER BY end_cum_cyc
             )
             if i == 0:
                 handles.append(handle)
-        span_type_count += 1
-
-# don't always have context switches
-#    # draw context switches, different label per incoming thread
-#    con.execute('''--sql
-# SELECT
-#    time,
-#    tid_in,
-#    flags
-# FROM context_switches_view
-# WHERE time BETWEEN {start_ns} AND {end_ns}
-# ORDER BY time
-# ;'''.format(start_ns=start_ns, end_ns=end_ns))
-#    switches = con.fetchall()
-#
-#    if len(switches) > 0:
-#        labels.append('context switch')
-#        for i, switch in enumerate(switches):
-#            handle = ax3.axvline(
-#                switch[0],
-#                color='r',
-#            )
-#            if i == 0:
-#                handles.append(handle)
-#        span_type_count += 1
+# always increment to make legend more deterministic
+span_type_count += 1
 
 ax3.legend(
     handles,

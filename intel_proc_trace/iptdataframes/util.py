@@ -11,11 +11,9 @@ class SqlUtil(object):
         self.conn.execute(sql)
         return self.conn.df()
 
-    def execute_script(self, sql: str) -> collections.abc.Generator[pandas.DataFrame]:
+    def execute_script(self, sql: str) -> list[pandas.DataFrame]:
         statements = self.conn.extract_statements(sql)
-        for statement in statements:
-            self.conn.execute(statement)
-            yield self.conn.df()
+        return [self.conn.execute(statement) for statement in statements]
 
     def close(self):
         self.conn.close()
