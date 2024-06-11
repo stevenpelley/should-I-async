@@ -21,8 +21,8 @@ db_file = "databases/async_retcomp.duckdb"
 # db_file = "databases/sync_retcomp.duckdb"
 # db_file = "databases/sync_retcomp_kernelonly_noswitchevents.duckdb"
 
-if 'conn' in locals() and conn is not None:
-    conn.close()
+if 'conn' in locals() and conn is not None:  # type: ignore - conn not defined warning
+    conn.close()  # type: ignore - conn not defined warning
 conn = iptutil.SqlUtil(db_file)
 
 conn.configure(
