@@ -1,0 +1,305 @@
+# %%
+# imports
+
+from IPython import get_ipython  # nopep8: E402
+get_ipython().run_line_magic('load_ext', 'autoreload')  # nopep8: E402
+get_ipython().run_line_magic('autoreload', '2')  # nopep8: E402
+
+import numpy
+from matplotlib import pyplot as plt
+import matplotlib
+import iptdataframes.util as iptutil
+import collections
+
+# %%
+# definitions
+
+# set which database file to use
+# db_file = "databases/async.duckdb"
+db_file = "databases/async_retcomp.duckdb"
+# db_file = "databases/sync.duckdb"
+# db_file = "databases/sync_retcomp.duckdb"
+# db_file = "databases/sync_retcomp_kernelonly_noswitchevents.duckdb"
+
+if 'conn' in locals() and conn is not None:
+    conn.close()
+conn = iptutil.SqlUtil(db_file)
+
+conn.configure(
+    window_size_cyc=2_000,
+    long_sample_limit_cyc=500,
+    timeline_duration_ns=15_000,
+    cumulative_longest_time_to_discard=0.01
+)
+
+# %%
+conn.setup()
+
+# %%
+conn.time_series_prep()
+
+# %%
+conn.cdf_prep()
+
+# %%
+conn.events_prep()
+
+# %%
+# time series plots
+
+# %matplotlib widget
+
+# plot 1: individual samples
+
+plt.close()
+fig, (ax1, ax2, ax3) = plt.subplots(
+    nrows=3,
+    sharex=True,
+    layout='constrained')
+
+# plot 1: raw timestamped ranges
+range_data = conn.execute('''--sql
+SELECT
+    start_cum_cyc,
+    end_cum_cyc,
+    cast(insn_count as real) / cyc_count as ipc,
+    cyc_count,
+FROM timestamped_ranges
+WHERE end_cum_cyc BETWEEN {} AND {}
+ORDER BY end_cum_cyc
+;'''.format(conn.start_cyc, conn.end_cyc))
+range_data['start_ns'] = conn.time_cyc_to_ns(range_data['start_cum_cyc'])
+range_data['end_ns'] = conn.time_cyc_to_ns(range_data['end_cum_cyc'])
+ax1.hlines(
+    y='ipc',
+    xmin='start_ns',
+    xmax='end_ns',
+    data=range_data,
+)
+ax1.set_title('Individual timestamped samples')
+ax1.set_ylabel('IPC')
+
+# plot 2: rolling average and error bounds
+
+span_data = conn.execute('''--sql
+SELECT *
+FROM ipc_spans
+WHERE window_end_cum_cyc BETWEEN {} AND {}
+ORDER BY window_end_cum_cyc
+;'''.format(conn.start_cyc, conn.end_cyc))
+span_data['end_ns'] = conn.time_cyc_to_ns(span_data['window_end_cum_cyc'])
+
+plot_handle = ax2.plot(
+    'end_ns',
+    'end_linear_interp_ipc',
+    data=span_data,
+    label='interpolated ipc')
+
+# plot the ipc range rectangles
+span_data['span_start_ns'] = conn.time_cyc_to_ns(span_data['span_start_cyc'])
+span_data['span_width_ns'] = conn.duration_cyc_to_ns(
+    span_data['span_width_cyc'])
+span_data['ipc_range'] = span_data['optimistic_ipc'] - \
+    span_data['conservative_ipc']
+
+patches = []
+for index, row in span_data.iterrows():
+    patches.append(matplotlib.patches.Rectangle(
+        (row['span_start_ns'], row['conservative_ipc'],),
+        row['span_width_ns'],
+        row['ipc_range'],
+    ))
+patches_collection = matplotlib.collections.PatchCollection(
+    patches,
+    alpha=0.5,
+    color='tab:cyan')
+ax2.add_collection(patches_collection)
+proxy_patch = matplotlib.patches.Patch(
+    alpha=0.5,
+    color='tab:cyan',
+    label='ipc error bound')
+
+# draw in individual ranges with durations exceeding some threshold
+range_data['start_ns'] = conn.time_cyc_to_ns(range_data['start_cum_cyc'])
+range_data['end_ns'] = conn.time_cyc_to_ns(range_data['end_cum_cyc'])
+
+long_range_data = range_data[range_data.cyc_count > conn.long_sample_limit_cyc]
+hlines_handle = ax2.hlines(
+    y='ipc',
+    xmin='start_ns',
+    xmax='end_ns',
+    data=long_range_data,
+    color='r',
+    label='ranges > {}'.format(conn.long_sample_limit_cyc),
+)
+ax2.set_title('Rolling average (window={} cycles)'.format(
+    conn.window_size_cyc))
+ax2.set_ylabel('IPC')
+ax2.legend(
+    handles=[plot_handle[0], hlines_handle, proxy_patch],
+)
+
+# plot 3: significant events timeline
+on_cpu_syscalls = conn.execute('''--sql
+SELECT
+    starts_time,
+    ends_time,
+    coalesce(starts_name, ends_name) AS name
+FROM on_cpu_syscalls
+WHERE
+    (starts_time BETWEEN {start_ns} AND {end_ns}
+        OR ends_time BETWEEN {start_ns} AND {end_ns})
+-- order by name to make legend markers more deterministic
+ORDER BY name
+;'''.format(end_ns=conn.end_ns, start_ns=conn.start_ns))
+
+d = collections.defaultdict(list)
+for t in on_cpu_syscalls.itertuples(index=False):
+    label = t[2].lstrip('_')
+    d[label].append(t[0:2])
+labels = []
+handles = []
+hatches = ['/', '\\', 'x']
+colors = ['orange', 'green', 'blue', 'red']
+span_type_count = 0
+for label, spans in d.items():
+    labels.append(label)
+    for i, span in enumerate(spans):
+        handle = ax3.axvspan(
+            xmin=span[0],
+            xmax=span[1],
+            facecolor=colors[span_type_count % len(colors)],
+            hatch=hatches[span_type_count % len(hatches)]
+        )
+        if i == 0:
+            handles.append(handle)
+    span_type_count += 1
+
+# plot context switches
+context_switches = conn.execute('''--sql
+SELECT
+    smio_call_time AS time
+FROM context_switches
+WHERE time BETWEEN {start_ns} AND {end_ns}
+;'''.format(end_ns=conn.end_ns, start_ns=conn.start_ns))
+
+labels.append('context switches')
+for i, *switch in context_switches.itertuples(index=True):
+    handle = ax3.axvline(
+        x=switch[0],
+        color='r'
+    )
+    if i == 0:
+        handles.append(handle)
+
+# find and plot overflow errors
+if conn.have_errors_table:
+    errors = conn.execute('''--sql
+SELECT
+    start_time,
+    end_time,
+FROM errors_and_ranges
+WHERE
+    (start_time <= {start_ns} AND end_time >= {end_ns})
+    OR start_time BETWEEN {start_ns} AND {end_ns}
+    OR end_time BETWEEN {start_ns} AND {end_ns}
+ORDER BY end_cum_cyc
+;'''.format(start_ns=conn.start_ns, end_ns=conn.end_ns))
+
+    if len(errors) > 0:
+        labels.append('trace overflow')
+        for i, *err in errors.itertuples(index=True):
+            handle = ax3.axvspan(
+                xmin=err[0],
+                xmax=err[1],
+                facecolor=colors[span_type_count % len(colors)],
+                hatch=hatches[span_type_count % len(hatches)]
+            )
+            if i == 0:
+                handles.append(handle)
+# always increment to make legend more deterministic
+span_type_count += 1
+
+ax3.legend(
+    handles,
+    labels,
+)
+# force the markers to appear at the top
+ax3.set_yticks([])
+ax3.set_title('syscall events')
+ax3.set_xlabel("ns since host boot")
+
+# %%
+# cdfs
+
+# 1. calculate the cdf of timestamped range durations in cycles.
+# 2. plot the distributions as contour lines of instructions or IPC
+# 3. plot the cdf weighted by duration.  This displays cumulative time spent in
+# ranges of each duration, not simply frequency.
+
+range_data = conn.execute('select * from range_cdf')
+cyc_count, cdf, weighted_cdf, *_ = range_data[range_data['cdf'] > 0.95].T.iloc
+
+plt.close()
+fig, (ax1, ax2, ax3) = plt.subplots(
+    nrows=3, sharex=True, layout='constrained')
+ax1.semilogx(cyc_count, cdf)
+ax1.set_title('CDF of sample range durations (cycles)')
+ax2.semilogx(cyc_count, weighted_cdf)
+ax2.set_title('CDF, weighted by duration')
+
+min_cyc_count = cyc_count.min()
+
+range_data = conn.execute("""--sql
+with t1 as (
+SELECT
+    cyc_count,
+    insn_count,
+    cast(insn_count as real) / cyc_count as ipc,
+    CASE
+        WHEN insn_count <= 35 THEN 0
+        WHEN insn_count <= 100 THEN 1
+        ELSE 2
+    END AS insn_group
+from samples_for_cdf
+where cyc_count >= {min_cyc_count}
+)
+SELECT
+cyc_count,
+cast(count(*) FILTER (insn_group = 0) * cyc_count as real) /
+    (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_0,
+cast(count(*) FILTER (insn_group = 1) * cyc_count as real) /
+    (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_1,
+cast(count(*) FILTER (insn_group = 2) * cyc_count as real) /
+    (select sum(cyc_count) from samples_for_cdf) as weighted_insn_count_2,
+from t1
+group by cyc_count
+order by cyc_count
+;""".format(min_cyc_count=min_cyc_count))
+
+bins = numpy.logspace(
+    numpy.log10(numpy.min(cyc_count)),
+    numpy.log10(numpy.max(cyc_count)),
+    30)
+kwargs = {
+    'data': range_data,
+    'x': 'cyc_count',
+    'bins': bins,
+    # 'density': True,
+}
+ax3.hist(weights='weighted_insn_count_0', label='35', **kwargs)
+ax3.hist(weights='weighted_insn_count_1', label='100', **kwargs)
+ax3.hist(weights='weighted_insn_count_2', label='>100', **kwargs)
+ax3.legend()
+ax3.set_title(
+    'Perc. time in samples by duration (cycles) and # instructions')
+ax3.set_ylabel("% time")
+ax3.set_xlabel("cycles")
+
+# %%
+# post-read IPC
+
+
+# %%
+# teardown
+conn.close()

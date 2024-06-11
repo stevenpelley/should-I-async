@@ -20,11 +20,8 @@ Goals and todos:
 
 ## Current task
 
-I just deleted my whole morning's work:
-locating context switches
-on-cpu-syscalls
-
-plotting on-cpu-syscalls and context switches
+Make the y axis consistent on the timeline so that different runs can be compared easily.
+Think about how to compare these graphs.  What does it tell us or what argument does it make?  Is this the right visualization?
 
 ### on plotting events when we don't have context switches and only record kernel mode
 
@@ -95,6 +92,33 @@ No, in fact this is the caller of __perf_event_task_sched_out and helps to valid
 This looks largely similar but without all the perf calls, so let's proceed
 
 What's an skb?  There are long-running functions like skb_release_head_state and consume_skb followed by unix_destruct_scm and unix_write_space
+
+### Plotting function call timeline
+This is research into plotting function calls alongside the intel pt samples and IPC.
+A challenge in this research is that there isn't a specific name for this sort of plot or tool and so it's hard to search for it.  It doesn't appear that any of the popular python visualization/plotting libraries support this out of the box.
+
+Names:
+"span" or "time span"
+"frames"
+"traces"
+"profile"
+
+Tools:
+Each has custom data source formats and limited support for other data and plots:
+perfetto - https://perfetto.dev/ access the UI at https://ui.perfetto.dev/
+Chromium FrameViewer - https://www.chromium.org/developers/how-tos/trace-event-profiling-tool/frame-viewer/ and https://www.chromium.org/developers/how-tos/trace-event-profiling-tool/using-frameviewer/  Going to "about:tracing" in chrome suggests "try the new perfetto ui" at https://ui.perfetto.dev/ so these tools are related.  Yeah it was deprecated in July 2022
+Tracy Profiler - https://github.com/wolfpld/tracy.  Can import chrome:tracing and Fuchsia trace format.
+
+Common formats
+perfetto - protobuf format.  Fairly complicated but rich.  Not sure how to easily incorporate less structured data without first putting it into protobufs.  See https://perfetto.dev/docs/reference/synthetic-track-event
+There was some legacy chrome:tracing json format but it appears deprecated
+
+So far it really looks like perfetto is the best tool out there.  Is there some simpler way to get data in?
+
+Perfetto uses a fork of SQLite which provides a number of operators for time series traces (find span overlap, ancestor and child spans, etc).
+How would I get function call data and ipt sample data in?  The sample data may be especially hard since there's no pre-existing metric that looks like this.
+
+This is such a big, complex project.  I really don't want to learn all of this for what I'm doing.
 
 ### sync and switch events
 switch events (perf record --switch events, enabled by default with ipt, disable with --no-switch-events) incur a fairly heavy cost on each context switch resulting in a ~30% slowdown.  Unfortunately, this data is required for _any_ userspace decoding.  Without it the decoder doesn't have access to the virtual address mapping or stack and so calls and returns are meaningless.
